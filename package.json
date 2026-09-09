@@ -1,8 +1,8 @@
 {
   "name": "omp-accounts",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "type": "module",
-  "description": "Multi-OAuth-account management for omp: list, pin, quota-aware rotation, per-model ceilings",
+  "description": "Multi-OAuth-account management for omp: list, pin, rotation policies (default|smart), per-model ceilings",
   "main": "./index.ts",
   "omp": {
     "extensions": [
@@ -26,5 +26,8 @@
   "bugs": {
     "url": "https://github.com/alex-mextner/omp-accounts/issues"
   },
-  "homepage": "https://github.com/alex-mextner/omp-accounts#readme"
+  "homepage": "https://github.com/alex-mextner/omp-accounts#readme",
+  "scripts": {
+    "test": "bun test"
+  }
 }

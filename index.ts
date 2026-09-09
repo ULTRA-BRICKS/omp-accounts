@@ -24,7 +24,7 @@ import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@o
 // re-declared here so the extension stays self-contained).
 // ---------------------------------------------------------------------------
 
-interface OAuthAccountSummary {
+export interface OAuthAccountSummary {
 	position: number;
 	credentialId: number;
 	accountId?: string;
@@ -55,13 +55,14 @@ interface AuthStorageLike {
 	getOAuthAccountIdentity(
 		provider: string,
 		sessionId?: string,
-	): { accountId?: string; email?: string; projectId?: string } | undefined;
+	): { accountId?: string; email?: string; projectId?: string; orgName?: string } | undefined;
 	getModelUsageHealth(
 		provider: string,
 		options: { modelId?: string; sessionId?: string; baseUrl?: string; reserveFraction: number },
 	): Promise<ModelUsageHealth>;
 	removeCredential(provider: string, credentialId: number): Promise<boolean>;
 	describeCredentialSource?(provider: string, sessionId?: string): string | undefined;
+	list?(): string[];
 }
 
 // ---------------------------------------------------------------------------
@@ -77,9 +78,10 @@ interface ModelCeilingRule {
 	fallback?: string;
 }
 
+export type RotationPolicy = "default" | "smart";
+
 interface AccountsConfig {
-	/** Max-remaining-quota rotation policy toggle. */
-	rotation: boolean;
+	rotationPolicy: RotationPolicy;
 	/** Reserve fraction passed to getModelUsageHealth. Default 0.1. */
 	reserveFraction: number;
 	/**
@@ -98,34 +100,75 @@ const USER_CONFIG_PATH = path.join(process.env.PI_CODING_AGENT_DIR ?? path.join(
 // persistence land in the stable agent-dir location; drop-in installs with a config
 // next to the module keep their historical file.
 const CONFIG_PATH = existsSync(USER_CONFIG_PATH) || !existsSync(MODULE_CONFIG_PATH) ? USER_CONFIG_PATH : MODULE_CONFIG_PATH;
+const CONFIG_FILE_EXISTED = existsSync(CONFIG_PATH);
+
+
+/** Resolve rotation policy from raw JSON with migration from legacy `rotation` boolean. */
+export function normalizeRotationPolicy(raw: Record<string, unknown>, configFileExisted: boolean): RotationPolicy {
+	if (raw.rotationPolicy === "smart" || raw.rotationPolicy === "default") {
+		return raw.rotationPolicy;
+	}
+	if (raw.rotation === true) return "smart";
+	if (raw.rotation === false) return "default";
+	return configFileExisted ? "default" : "smart";
+}
+
+export interface RotationModeParse {
+	policy?: RotationPolicy;
+	deprecated?: string;
+	error?: string;
+}
+
+export function parseRotationMode(mode: string): RotationModeParse {
+	const lower = mode.trim().toLowerCase();
+	if (lower === "smart" || lower === "default") return { policy: lower as RotationPolicy };
+	if (lower === "on") return { policy: "smart", deprecated: '"on" is deprecated — use "smart" (max-remaining-quota pin each turn)' };
+	if (lower === "off") return { policy: "default", deprecated: '"off" is deprecated — use "default" (built-in omp rotation)' };
+	return { error: "Usage: /accounts rotation default|smart|status" };
+}
+
+function parseModels(raw: Record<string, unknown>): Record<string, ModelCeilingRule> {
+	const models: Record<string, ModelCeilingRule> = {};
+	if (!raw.models || typeof raw.models !== "object") return models;
+	for (const [key, value] of Object.entries(raw.models as Record<string, unknown>)) {
+		if (typeof value === "number" && Number.isFinite(value)) {
+			models[key] = { maxUsedFraction: value };
+			continue;
+		}
+		if (value && typeof value === "object") {
+			const obj = value as Record<string, unknown>;
+			models[key] = {
+				maxUsedFraction:
+					typeof obj.maxUsedFraction === "number" && Number.isFinite(obj.maxUsedFraction) ? obj.maxUsedFraction : 0.9,
+				fallback: typeof obj.fallback === "string" && obj.fallback.trim() ? obj.fallback.trim() : undefined,
+			};
+		}
+	}
+	return models;
+}
+
+function saveConfig(config: AccountsConfig): void {
+	const payload = {
+		rotationPolicy: config.rotationPolicy,
+		reserveFraction: config.reserveFraction,
+		rotationMargin: config.rotationMargin,
+		models: config.models,
+	};
+	writeFileSync(CONFIG_PATH, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
+}
 
 function loadConfig(): AccountsConfig {
-	const fallback: AccountsConfig = { rotation: false, reserveFraction: 0.1, rotationMargin: 0.1, models: {} };
-	if (!existsSync(CONFIG_PATH)) return fallback;
+	const fallback: AccountsConfig = {
+		rotationPolicy: normalizeRotationPolicy({}, CONFIG_FILE_EXISTED),
+		reserveFraction: 0.1,
+		rotationMargin: 0.1,
+		models: {},
+	};
+	if (!CONFIG_FILE_EXISTED) return fallback;
 	try {
 		const raw = JSON.parse(readFileSync(CONFIG_PATH, "utf8")) as Record<string, unknown>;
-		const models: Record<string, ModelCeilingRule> = {};
-		if (raw.models && typeof raw.models === "object") {
-			for (const [key, value] of Object.entries(raw.models as Record<string, unknown>)) {
-				if (typeof value === "number" && Number.isFinite(value)) {
-					models[key] = { maxUsedFraction: value };
-					continue;
-				}
-				if (value && typeof value === "object") {
-					const obj = value as Record<string, unknown>;
-					models[key] = {
-						maxUsedFraction:
-							typeof obj.maxUsedFraction === "number" && Number.isFinite(obj.maxUsedFraction)
-								? obj.maxUsedFraction
-								: 0.9,
-						fallback:
-							typeof obj.fallback === "string" && obj.fallback.trim() ? obj.fallback.trim() : undefined,
-					};
-				}
-			}
-		}
 		return {
-			rotation: raw.rotation === true,
+			rotationPolicy: normalizeRotationPolicy(raw, true),
 			reserveFraction:
 				typeof raw.reserveFraction === "number" && raw.reserveFraction >= 0 && raw.reserveFraction < 1
 					? raw.reserveFraction
@@ -134,7 +177,7 @@ function loadConfig(): AccountsConfig {
 				typeof raw.rotationMargin === "number" && raw.rotationMargin >= 0 && raw.rotationMargin < 1
 					? raw.rotationMargin
 					: 0.1,
-			models,
+			models: parseModels(raw),
 		};
 	} catch {
 		return fallback;
@@ -162,11 +205,32 @@ function say(ctx: Ctx, text: string, type: "info" | "warning" | "error" = "info"
 	}
 }
 
-function accountLabel(account: OAuthAccountSummary): string {
-	const base = account.email ?? account.accountId ?? `credential ${account.credentialId}`;
-	// Default org names are just "<email>'s Organization" — redundant with the label.
-	const org = account.orgName;
-	return org && org !== `${account.email}'s Organization` ? `${base} (${org})` : base;
+function isRedundantOrgName(org: string, email: string): boolean {
+	return org === `${email}'s Organization` || org === `${email}'s organisation`;
+}
+
+/** Best-effort readable label: email → orgName (if meaningful) → accountId → credential id. */
+export function accountLabel(account: OAuthAccountSummary): string {
+	if (account.email) {
+		const org = account.orgName?.trim();
+		if (org && !isRedundantOrgName(org, account.email)) return `${account.email} (${org})`;
+		return account.email;
+	}
+	const org = account.orgName?.trim();
+	if (org) return org;
+	if (account.accountId) return account.accountId;
+	return `credential ${account.credentialId}`;
+}
+
+function identityLabel(identity: { email?: string; accountId?: string; orgName?: string } | undefined): string {
+	if (!identity) return "none resolved yet";
+	if (identity.email) {
+		const org = identity.orgName?.trim();
+		if (org && !isRedundantOrgName(org, identity.email)) return `${identity.email} (${org})`;
+		return identity.email;
+	}
+	if (identity.orgName?.trim()) return identity.orgName.trim();
+	return identity.accountId ?? "unknown";
 }
 
 function formatPercent(fraction: number): string {
@@ -188,6 +252,49 @@ function usedFractionOf(entry: ModelUsageAccountHealth): number | undefined {
 	return entry.state === "depleted" ? 1 : undefined;
 }
 
+
+function providersWithStoredAccounts(ctx: Ctx, auth: AuthStorageLike): string[] {
+	const providers = new Set<string>();
+	try {
+		for (const model of ctx.models.list()) providers.add(model.provider);
+	} catch {
+		// best-effort
+	}
+	try {
+		for (const p of auth.list?.() ?? []) providers.add(p);
+	} catch {
+		// best-effort
+	}
+	const sessionId = ctx.sessionManager.getSessionId();
+	const result: string[] = [];
+	for (const provider of providers) {
+		try {
+			if (auth.listOAuthAccounts(provider, sessionId).length > 0) result.push(provider);
+		} catch {
+			// skip
+		}
+	}
+	return result.sort();
+}
+
+const ROTATION_SMART_ASCII = [
+	"Smart rotation (10% hysteresis margin):",
+	"  Turn1: A(80%) → pin A",
+	"  Turn2: B(90%) → stay A  (90% ≤ 80%+10%)",
+	"  Turn3: B(95%) → pin B   (95% > 80%+10%)",
+].join("\n");
+
+const ROTATION_DEFAULT_ASCII = [
+	"Default rotation (built-in omp):",
+	"  omp ranks accounts by required drain / stickiness",
+	"  Use /accounts set to override for this session",
+].join("\n");
+
+const CEILING_ASCII = [
+	"Ceiling example (90% used → fallback):",
+	"  opus:  █████████░ 92% used → switch to sonnet",
+	"  sonnet: ████░░░░░░ 40% used → stay",
+].join("\n");
 function resolveAccount(
 	accounts: OAuthAccountSummary[],
 	selector: string,
@@ -225,21 +332,28 @@ interface SubcommandSpec {
 }
 
 const SUBCOMMANDS: SubcommandSpec[] = [
-	{ name: "list", description: "List OAuth accounts with quota state (default: current provider)", usage: "[provider]" },
-	{ name: "set", description: "Pin an account to this session (interactive picker without args)", usage: "<n|email|accountId>" },
-	{ name: "unset", description: "Release the pin; native usage-aware rotation resumes" },
-	{ name: "auto", description: "Alias for unset" },
-	{ name: "rotation", description: "Max-remaining-quota rotation policy", usage: "on|off|status" },
-	{ name: "login", description: "Start the OAuth login flow (pre-fills /login)", usage: "[provider]" },
-	{ name: "logout", description: "Remove a stored OAuth account (interactive picker without args)", usage: "[n|email|accountId]" },
-	{ name: "ceiling", description: "Show per-model quota ceiling rules" },
-	{ name: "help", description: "Show this help" },
+	{ name: "list", description: "Show OAuth accounts with quota (current provider expanded; others summarized)", usage: "[provider|all]" },
+	{ name: "set", description: "Pin one account for this session — keeps prompt cache warm on Anthropic", usage: "<n|email|accountId>" },
+	{ name: "unset", description: "Release the pin; built-in omp rotation resumes for this session" },
+	{ name: "auto", description: "Alias for unset — hand control back to omp" },
+	{ name: "rotation", description: "Rotation policy: default (built-in omp) or smart (max remaining quota)", usage: "default|smart|status" },
+	{ name: "login", description: "Start OAuth login — pre-fills /login so you only press Enter", usage: "[provider]" },
+	{ name: "logout", description: "Remove a stored OAuth account from disk (interactive picker without args)", usage: "[n|email|accountId]" },
+	{ name: "ceiling", description: "Per-model quota ceilings — switch to a fallback model before hard limits", usage: "set <model> <percent> [fallback] | unset <model>" },
+	{ name: "help", description: "Show command reference with use cases" },
 ];
 
 const HELP_TEXT = [
+	"OAuth account management — CLI-first; config file is storage only.",
+	"",
 	...SUBCOMMANDS.map(s => `/accounts ${s.name}${s.usage ? ` ${s.usage}` : ""} — ${s.description}`),
 	"",
-	"Tab-completion: subcommands, account numbers/emails for set|logout, on|off|status for rotation, providers for list|login.",
+	ROTATION_SMART_ASCII,
+	"",
+	CEILING_ASCII,
+	"",
+	"Tab-completion: subcommands, accounts for set|logout, default|smart|status for rotation.",
+	"Providers with stored OAuth accounts + 'all' for list.",
 ].join("\n");
 
 /**
@@ -300,6 +414,31 @@ export function decideRotation(
 // Extension factory
 // ---------------------------------------------------------------------------
 
+
+function rotationStatusText(config: AccountsConfig, identity?: { email?: string; accountId?: string; orgName?: string }): string {
+	const policyLine =
+		config.rotationPolicy === "smart"
+			? "Rotation: smart (max remaining quota)"
+			: "Rotation: default (built-in omp)";
+	const diagram = config.rotationPolicy === "smart" ? ROTATION_SMART_ASCII : ROTATION_DEFAULT_ASCII;
+	return [
+		policyLine,
+		`Hysteresis margin: ${formatPercent(config.rotationMargin)} (depleted active account always rotates)`,
+		`Active account: ${identityLabel(identity)}`,
+		"",
+		diagram,
+		"",
+		`Config: ${CONFIG_PATH}`,
+	].join("\n");
+}
+
+/**
+ * Second-level completions for a known subcommand.
+ * Workaround for TUI bug: first Space after subcommand may not reopen the dropdown
+ * (packages/tui/src/components/editor.ts #isSlashCommandNameAutocompleteSelection only
+ * chains when textBeforeCursor has no space yet). When the prefix exactly matches a
+ * subcommand name, return argument completions here too.
+ */
 export default function accountsExtension(pi: ExtensionAPI) {
 	pi.setLabel("Accounts");
 
@@ -315,35 +454,115 @@ export default function accountsExtension(pi: ExtensionAPI) {
 	const completionCache = {
 		currentProvider: undefined as string | undefined,
 		providers: new Set<string>(),
+		loggedInProviders: [] as string[],
 		accountsByProvider: new Map<string, OAuthAccountSummary[]>(),
+		modelIds: [] as string[],
 	};
 
 	function refreshCompletionCache(ctx: Ctx): void {
 		const provider = ctx.model?.provider;
+		const auth = authOf(ctx);
 		if (provider) {
 			completionCache.currentProvider = provider;
 			completionCache.providers.add(provider);
 		}
 		try {
-			for (const model of ctx.models.list()) completionCache.providers.add(model.provider);
+			for (const model of ctx.models.list()) {
+				completionCache.providers.add(model.provider);
+				if (!completionCache.modelIds.includes(model.id)) completionCache.modelIds.push(model.id);
+			}
 		} catch {
 			// model listing is best-effort for completion only
 		}
+		completionCache.loggedInProviders = providersWithStoredAccounts(ctx, auth);
 		if (!provider) return;
 		try {
 			completionCache.accountsByProvider.set(
 				provider,
-				authOf(ctx).listOAuthAccounts(provider, ctx.sessionManager.getSessionId()),
+				auth.listOAuthAccounts(provider, ctx.sessionManager.getSessionId()),
 			);
 		} catch {
 			// keep the stale cache
 		}
 	}
 
+	function completeSubcommandArgs(
+		sub: string,
+		argPrefix: string,
+		cache: {
+			currentProvider?: string;
+			providers: Set<string>;
+			loggedInProviders: string[];
+			modelIds: string[];
+		},
+	): CompletionItem[] | null {
+		const lowerArg = argPrefix.toLowerCase();
+		if (sub === "rotation") {
+			const modes = [
+				{ name: "default", description: "Built-in omp quota-aware rotation", hint: "native ranker" },
+				{ name: "smart", description: "Pin max-remaining account each turn (10% hysteresis)", hint: "max quota" },
+				{ name: "status", description: "Show rotation policy, margin, and active account" },
+			].filter(m => m.name.startsWith(lowerArg));
+			return modes.length > 0
+				? modes.map(m => ({ value: `rotation ${m.name} `, label: m.name, description: m.description, hint: m.hint }))
+				: null;
+		}
+		if (sub === "ceiling") {
+			if (!lowerArg) {
+				return [
+					{ value: "ceiling set ", label: "set", description: "Add or update a per-model ceiling rule" },
+					{ value: "ceiling unset ", label: "unset", description: "Remove a ceiling rule for one model" },
+				];
+			}
+			if (lowerArg.startsWith("set")) {
+				const rest = argPrefix.slice(3).trimStart();
+				const parts = rest.split(/\s+/).filter(Boolean);
+				if (parts.length === 0) {
+					return cache.modelIds.map(id => ({ value: `ceiling set ${id} `, label: id, description: "model to cap" }));
+				}
+				if (parts.length === 1) {
+					return ["80", "85", "90", "95"].map(p => ({
+						value: `ceiling set ${parts[0]} ${p} `,
+						label: `${p}%`,
+						description: `switch when > ${p}% of quota is used`,
+					}));
+				}
+			}
+			if (lowerArg.startsWith("unset")) {
+				const modelPart = argPrefix.slice(5).trimStart().toLowerCase();
+				return cache.modelIds
+					.filter(id => !modelPart || id.toLowerCase().includes(modelPart))
+					.map(id => ({ value: `ceiling unset ${id} `, label: id, description: "remove ceiling" }));
+			}
+		}
+		if (sub === "list") {
+			const providers = ["all", ...cache.loggedInProviders].filter(p => p.startsWith(lowerArg)).sort();
+			return providers.length > 0
+				? providers.map(p => ({
+						value: `list ${p} `,
+						label: p,
+						description: p === "all" ? "all logged-in providers expanded" : p === cache.currentProvider ? "current provider" : "stored OAuth accounts",
+					}))
+				: null;
+		}
+		if (sub === "login") {
+			const providers = [...cache.providers].filter(p => p.startsWith(lowerArg)).sort();
+			return providers.length > 0
+				? providers.map(p => ({ value: `login ${p} `, label: p, description: p === cache.currentProvider ? "current provider" : undefined }))
+				: null;
+		}
+		return null;
+	}
+
 	function completeAccountsArgument(argumentPrefix: string): CompletionItem[] | null {
 		const spaceIndex = argumentPrefix.indexOf(" ");
 		if (spaceIndex === -1) {
 			const lower = argumentPrefix.toLowerCase();
+			const exact = SUBCOMMANDS.find(s => s.name === lower);
+			if (exact) {
+				const nested = completeSubcommandArgs(exact.name, "", completionCache);
+				if (nested) return nested;
+			}
 			const matches = SUBCOMMANDS.filter(s => s.name.startsWith(lower)).map(s => ({
 				value: `${s.name} `,
 				label: s.name,
@@ -354,20 +573,10 @@ export default function accountsExtension(pi: ExtensionAPI) {
 		}
 		const sub = argumentPrefix.slice(0, spaceIndex).toLowerCase();
 		const argPrefix = argumentPrefix.slice(spaceIndex + 1);
-		if (argPrefix.includes(" ")) return null; // complete one argument deep only
+		const nested = completeSubcommandArgs(sub, argPrefix, completionCache);
+		if (nested) return nested;
+		if (argPrefix.includes(" ")) return null;
 		const lowerArg = argPrefix.toLowerCase();
-
-		if (sub === "rotation") {
-			const modes = [
-				{ name: "on", description: "Pin the account with the most remaining quota each turn" },
-				{ name: "off", description: "Release the pin; native usage-aware rotation applies" },
-				{ name: "status", description: "Show rotation state, hysteresis margin, and active account" },
-			].filter(m => m.name.startsWith(lowerArg));
-			return modes.length > 0
-				? modes.map(m => ({ value: `rotation ${m.name} `, label: m.name, description: m.description }))
-				: null;
-		}
-
 		if (sub === "set" || sub === "logout") {
 			const provider = completionCache.currentProvider;
 			const accounts = provider ? (completionCache.accountsByProvider.get(provider) ?? []) : [];
@@ -388,18 +597,6 @@ export default function accountsExtension(pi: ExtensionAPI) {
 					}))
 				: null;
 		}
-
-		if (sub === "list" || sub === "login") {
-			const providers = [...completionCache.providers].filter(p => p.startsWith(lowerArg)).sort();
-			return providers.length > 0
-				? providers.map(p => ({
-						value: `${sub} ${p} `,
-						label: p,
-						description: p === completionCache.currentProvider ? "current provider" : undefined,
-					}))
-				: null;
-		}
-
 		return null;
 	}
 
@@ -530,6 +727,73 @@ export default function accountsExtension(pi: ExtensionAPI) {
 		}
 	}
 
+
+	async function formatProviderList(ctx: Ctx, provider: string): Promise<string[]> {
+		const auth = authOf(ctx);
+		const sessionId = ctx.sessionManager.getSessionId();
+		const accounts = auth.listOAuthAccounts(provider, sessionId);
+		if (accounts.length === 0) {
+			const source = auth.describeCredentialSource?.(provider, sessionId);
+			return source
+				? [`No stored OAuth accounts for ${provider}. Current auth comes from ${source}.`]
+				: [`No stored OAuth accounts for ${provider}. Use /login to add one.`];
+		}
+		const usage = await usageByCredential(ctx, provider);
+		const lines = [`OAuth accounts for ${provider}:`];
+		for (const account of accounts) {
+			lines.push(
+				`${account.position + 1}. ${accountLabel(account)}${account.active ? " (active)" : ""}${describeUsage(usage?.get(account.credentialId))}`,
+			);
+		}
+		lines.push("", "Pin one with /accounts set <number|email|account id>.");
+		return lines;
+	}
+
+	async function showCeilingStatus(ctx: Ctx): Promise<void> {
+		const lines = [
+			"Per-model quota ceilings — switch to a cheaper/fallback model before you hit hard limits.",
+			"Use: /accounts ceiling set <model> <percent> [fallback]  |  unset <model>",
+			"",
+			CEILING_ASCII,
+			"",
+		];
+		const entries = Object.entries(config.models);
+		if (entries.length === 0) {
+			lines.push("No ceilings configured yet. Example:");
+			lines.push("  /accounts ceiling set claude-opus-4-6 90 anthropic/claude-sonnet-4-6");
+			say(ctx, lines.join("\n"));
+			return;
+		}
+		lines.push("Configured rules (live quota when available):");
+		for (const [modelKey, rule] of entries) {
+			const resolved = ctx.models.resolve(modelKey);
+			let live = "";
+			if (resolved) {
+				try {
+					const health = await authOf(ctx).getModelUsageHealth(resolved.provider, {
+						modelId: resolved.id,
+						baseUrl: resolved.baseUrl,
+						sessionId: ctx.sessionManager.getSessionId(),
+						reserveFraction: config.reserveFraction,
+					});
+					const selected = health.accounts.find(a => a.selected);
+					const used = selected ? usedFractionOf(selected) : undefined;
+					if (used !== undefined) {
+						const bar = used >= rule.maxUsedFraction ? "OVER" : "ok";
+						live = ` — active ${formatPercent(used)} used [${bar}]`;
+					}
+				} catch {
+					// skip live line
+				}
+			}
+			lines.push(
+				`- ${modelKey}: switch at > ${formatPercent(rule.maxUsedFraction)} used${rule.fallback ? ` → ${rule.fallback}` : ""}${live}`,
+			);
+		}
+		lines.push("", `Persisted in ${CONFIG_PATH}`);
+		say(ctx, lines.join("\n"));
+	}
+
 	// -- events ---------------------------------------------------------------
 
 	pi.on("session_start", async (_event, ctx) => {
@@ -547,7 +811,7 @@ export default function accountsExtension(pi: ExtensionAPI) {
 		const provider = ctx.model?.provider;
 		if (!provider) return;
 		detectAccountSwitch(ctx, provider);
-		if (config.rotation) await applyRotation(ctx, provider, "turn_start");
+		if (config.rotationPolicy === "smart") await applyRotation(ctx, provider, "turn_start");
 		await applyCeiling(ctx);
 	});
 
@@ -667,7 +931,7 @@ export default function accountsExtension(pi: ExtensionAPI) {
 					say(
 						ctx,
 						released
-							? `Released the pinned ${provider} account; native usage-aware rotation is back in charge.`
+							? `Released the pinned ${provider} account; built-in omp rotation is back in charge.`
 							: `No ${provider} account was pinned for this session.`,
 					);
 					return;
@@ -680,24 +944,19 @@ export default function accountsExtension(pi: ExtensionAPI) {
 						const identity = provider
 							? authOf(ctx).getOAuthAccountIdentity(provider, ctx.sessionManager.getSessionId())
 							: undefined;
-						say(
-							ctx,
-							[
-								`Rotation (max remaining quota): ${config.rotation ? "ON" : "OFF"}`,
-								`Hysteresis margin: ${formatPercent(config.rotationMargin)} (depleted active account always rotates)`,
-								`Active account: ${identity ? (identity.email ?? identity.accountId ?? "unknown") : "none resolved yet"}`,
-								`Config: ${CONFIG_PATH}`,
-							].join("\n"),
-						);
+						say(ctx, rotationStatusText(config, identity));
 						return;
 					}
-					if (mode !== "on" && mode !== "off") {
-						say(ctx, "Usage: /accounts rotation on|off|status", "warning");
+					const parsed = parseRotationMode(mode);
+					if (parsed.error) {
+						say(ctx, parsed.error, "warning");
 						return;
 					}
-					config.rotation = mode === "on";
+					if (!parsed.policy) return;
+					if (parsed.deprecated) say(ctx, parsed.deprecated, "warning");
+					config.rotationPolicy = parsed.policy;
 					try {
-						writeFileSync(CONFIG_PATH, `${JSON.stringify(config, null, 2)}\n`, "utf8");
+						saveConfig(config);
 					} catch (error) {
 						say(
 							ctx,
@@ -707,23 +966,23 @@ export default function accountsExtension(pi: ExtensionAPI) {
 						return;
 					}
 					const provider = ctx.model?.provider;
-					if (!config.rotation) {
+					if (config.rotationPolicy === "default") {
 						if (provider) {
 							authOf(ctx).releaseSessionCredentialForReselection(provider, ctx.sessionManager.getSessionId());
 						}
-						say(ctx, "Rotation OFF. Released any pin; native usage-aware rotation applies.");
+						say(ctx, "Rotation: default (built-in omp). Released any pin.");
 						return;
 					}
 					if (!provider) {
-						say(ctx, "Rotation ON. It will apply on the next turn once a model is selected.");
+						say(ctx, "Rotation: smart (max remaining quota). Will apply on the next turn once a model is selected.");
 						return;
 					}
 					if (!ctx.isIdle()) {
-						say(ctx, "Rotation ON. It will apply starting with the next turn.");
+						say(ctx, "Rotation: smart. Will apply starting with the next turn.");
 						return;
 					}
 					await applyRotation(ctx, provider, "enabled");
-					say(ctx, "Rotation ON: each turn pins the account with the most remaining quota.");
+					say(ctx, "Rotation: smart (max remaining quota). Each turn pins the account with the most remaining quota.");
 					return;
 				}
 
@@ -801,27 +1060,69 @@ export default function accountsExtension(pi: ExtensionAPI) {
 				}
 
 				case "ceiling": {
-					const entries = Object.entries(config.models);
-					if (entries.length === 0) {
+					const [action, ...ceilingRest] = rest;
+					if (!action) {
+						await showCeilingStatus(ctx);
+						return;
+					}
+					if (action === "set") {
+						const [modelKey, percentStr, ...fallbackParts] = ceilingRest;
+						if (!modelKey || !percentStr) {
+							say(
+								ctx,
+								"Usage: /accounts ceiling set <model> <percent> [fallback]\nExample: /accounts ceiling set claude-opus-4-6 90 anthropic/claude-sonnet-4-6",
+								"warning",
+							);
+							return;
+						}
+						const percent = Number.parseFloat(percentStr);
+						if (!Number.isFinite(percent) || percent <= 0 || percent > 100) {
+							say(ctx, "Percent must be a number between 1 and 100 (quota used before switching).", "warning");
+							return;
+						}
+						const fallback = fallbackParts.join(" ").trim() || undefined;
+						config.models[modelKey] = { maxUsedFraction: percent / 100, fallback };
+						try {
+							saveConfig(config);
+						} catch (error) {
+							say(
+								ctx,
+								`Failed to persist ${CONFIG_PATH}: ${error instanceof Error ? error.message : error}`,
+								"error",
+							);
+							return;
+						}
 						say(
 							ctx,
-							`No per-model ceilings configured. Add a "models" map to ${CONFIG_PATH}, e.g.\n` +
-								`{ "models": { "claude-opus-4-6": { "maxUsedFraction": 0.9, "fallback": "anthropic/claude-sonnet-4-6" } } }\n` +
-								"Note: retry.usageReservePct already guards quota globally; ceilings add per-model control.",
+							`Ceiling set: ${modelKey} switches at > ${percent}% used${fallback ? ` → ${fallback}` : " (no fallback model — add one to enable auto-switch)"}.`,
 						);
 						return;
 					}
-					const lines = ["Per-model quota ceilings:"];
-					for (const [model, rule] of entries) {
-						lines.push(
-							`- ${model}: switch at > ${formatPercent(rule.maxUsedFraction)} used${rule.fallback ? ` → ${rule.fallback}` : ""}`,
-						);
+					if (action === "unset") {
+						const modelKey = ceilingRest.join(" ").trim();
+						if (!modelKey) {
+							say(ctx, "Usage: /accounts ceiling unset <model>", "warning");
+							return;
+						}
+						if (!config.models[modelKey]) {
+							say(ctx, `No ceiling configured for ${modelKey}.`, "warning");
+							return;
+						}
+						delete config.models[modelKey];
+						try {
+							saveConfig(config);
+						} catch (error) {
+							say(
+								ctx,
+								`Failed to persist ${CONFIG_PATH}: ${error instanceof Error ? error.message : error}`,
+								"error",
+							);
+							return;
+						}
+						say(ctx, `Ceiling removed for ${modelKey}.`);
+						return;
 					}
-					lines.push(
-						"",
-						`Edit ${CONFIG_PATH} to change; the global retry.usageReservePct reserve still applies on top.`,
-					);
-					say(ctx, lines.join("\n"));
+					say(ctx, `Unknown ceiling action "${action}". Use set, unset, or bare /accounts ceiling.`, "warning");
 					return;
 				}
 
