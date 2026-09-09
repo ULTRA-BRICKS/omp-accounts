@@ -831,37 +831,73 @@ export default function accountsExtension(pi: ExtensionAPI) {
 
 			switch (sub) {
 				case "list": {
-					const provider = restArgs || ctx.model?.provider;
-					if (!provider) {
-						say(ctx, "No model selected and no provider given. Use /accounts list <provider>.", "warning");
+					const auth = authOf(ctx);
+					const query = restArgs.trim();
+					const queryLower = query.toLowerCase();
+
+					if (queryLower === "all") {
+						const providers = providersWithStoredAccounts(ctx, auth);
+						if (providers.length === 0) {
+							say(ctx, "No stored OAuth accounts. Use /login to add one.");
+							return;
+						}
+						const allLines: string[] = [];
+						for (const p of providers) {
+							if (allLines.length > 0) allLines.push("");
+							allLines.push(...(await formatProviderList(ctx, p)));
+						}
+						say(ctx, allLines.join("\n"));
 						return;
 					}
-					const auth = authOf(ctx);
-					const sessionId = ctx.sessionManager.getSessionId();
-					const accounts = auth.listOAuthAccounts(provider, sessionId);
-					if (accounts.length === 0) {
-						const source = auth.describeCredentialSource?.(provider, sessionId);
+
+					if (query) {
+						say(ctx, (await formatProviderList(ctx, query)).join("\n"));
+						return;
+					}
+
+					const currentProvider = ctx.model?.provider;
+					if (!currentProvider) {
+						say(ctx, "No model selected and no provider given. Use /accounts list <provider|all>.", "warning");
+						return;
+					}
+
+					const loggedIn = providersWithStoredAccounts(ctx, auth);
+					if (loggedIn.length === 0) {
+						const source = auth.describeCredentialSource?.(currentProvider, ctx.sessionManager.getSessionId());
 						say(
 							ctx,
 							source
-								? `No stored OAuth accounts for ${provider}. Current auth comes from ${source}.`
-								: `No stored OAuth accounts for ${provider}. Use /login to add one.`,
+								? `No stored OAuth accounts for ${currentProvider}. Current auth comes from ${source}.`
+								: `No stored OAuth accounts. Use /login to add one.`,
 						);
 						return;
 					}
-					const usage = await usageByCredential(ctx, provider);
-					const lines = [`OAuth accounts for ${provider}:`];
-					for (const account of accounts) {
+
+					const lines: string[] = [];
+					if (loggedIn.includes(currentProvider)) {
+						lines.push(...(await formatProviderList(ctx, currentProvider)));
+					} else {
+						const source = auth.describeCredentialSource?.(currentProvider, ctx.sessionManager.getSessionId());
 						lines.push(
-							`${account.position + 1}. ${accountLabel(account)}${account.active ? " (active)" : ""}${describeUsage(usage?.get(account.credentialId))}`,
+							source
+								? `No stored OAuth accounts for ${currentProvider}. Current auth comes from ${source}.`
+								: `No stored OAuth accounts for ${currentProvider}. Use /login to add one.`,
 						);
 					}
-					lines.push("", "Pin one with /accounts set <number|email|account id>.");
+
+					const others = loggedIn.filter(p => p !== currentProvider);
+					if (others.length > 0) {
+						lines.push("", "Other providers with stored accounts (use /accounts list all to expand):");
+						const sessionId = ctx.sessionManager.getSessionId();
+						for (const p of others) {
+							const count = auth.listOAuthAccounts(p, sessionId).length;
+							lines.push(`- ${p}: ${count} stored account${count === 1 ? "" : "s"}`);
+						}
+					}
 					say(ctx, lines.join("\n"));
 					return;
-				}
-
-				case "set": {
+			}
+			case "set": {
 					const provider = ctx.model?.provider;
 					if (!provider) {
 						say(ctx, "Select a model before pinning a provider account.", "warning");
