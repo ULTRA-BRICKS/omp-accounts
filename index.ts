@@ -217,15 +217,41 @@ function resolveAccount(
 	return { account: matches[0] };
 }
 
+interface SubcommandSpec {
+	name: string;
+	description: string;
+	/** Dim ghost-hint shown inline after the cursor while the item is selected. */
+	usage?: string;
+}
+
+const SUBCOMMANDS: SubcommandSpec[] = [
+	{ name: "list", description: "List OAuth accounts with quota state (default: current provider)", usage: "[provider]" },
+	{ name: "set", description: "Pin an account to this session (interactive picker without args)", usage: "<n|email|accountId>" },
+	{ name: "unset", description: "Release the pin; native usage-aware rotation resumes" },
+	{ name: "auto", description: "Alias for unset" },
+	{ name: "rotation", description: "Max-remaining-quota rotation policy", usage: "on|off|status" },
+	{ name: "login", description: "Start the OAuth login flow (pre-fills /login)", usage: "[provider]" },
+	{ name: "logout", description: "Remove a stored OAuth account (interactive picker without args)", usage: "[n|email|accountId]" },
+	{ name: "ceiling", description: "Show per-model quota ceiling rules" },
+	{ name: "help", description: "Show this help" },
+];
+
 const HELP_TEXT = [
-	"/accounts list [provider] — list OAuth accounts (default: current provider)",
-	"/accounts set <n|email|accountId> — pin an account to this session",
-	"/accounts unset|auto — release the pin, restore native rotation",
-	"/accounts rotation on|off|status — pin the account with the most remaining quota each turn",
-	"/accounts login [provider] — start the OAuth login flow (pre-fills /login)",
-	"/accounts logout [n|email|accountId] — remove a stored OAuth account",
-	"/accounts ceiling — show per-model quota ceiling rules",
+	...SUBCOMMANDS.map(s => `/accounts ${s.name}${s.usage ? ` ${s.usage}` : ""} — ${s.description}`),
+	"",
+	"Tab-completion: subcommands, account numbers/emails for set|logout, on|off|status for rotation, providers for list|login.",
 ].join("\n");
+
+/**
+ * Structural mirror of pi-tui's AutocompleteItem. pi-coding-agent imports the
+ * type but does not re-export it, and this extension stays self-contained.
+ */
+interface CompletionItem {
+	value: string;
+	label: string;
+	description?: string;
+	hint?: string;
+}
 
 /** Remaining fraction (0..1) of a health entry, with state-based fallback. */
 function remainingOf(entry: ModelUsageAccountHealth): number {
@@ -281,6 +307,101 @@ export default function accountsExtension(pi: ExtensionAPI) {
 	const lastActiveBySession = new Map<string, string>();
 	/** Accounts we pinned ourselves: suppresses the external-rotation notification once. */
 	const selfPinnedBySession = new Map<string, string>();
+
+	// -- /accounts argument completion ------------------------------------------
+	// getArgumentCompletions receives no ctx and must return synchronously, so
+	// completion reads this cache; it is refreshed from session events and after
+	// every /accounts run.
+	const completionCache = {
+		currentProvider: undefined as string | undefined,
+		providers: new Set<string>(),
+		accountsByProvider: new Map<string, OAuthAccountSummary[]>(),
+	};
+
+	function refreshCompletionCache(ctx: Ctx): void {
+		const provider = ctx.model?.provider;
+		if (provider) {
+			completionCache.currentProvider = provider;
+			completionCache.providers.add(provider);
+		}
+		try {
+			for (const model of ctx.models.list()) completionCache.providers.add(model.provider);
+		} catch {
+			// model listing is best-effort for completion only
+		}
+		if (!provider) return;
+		try {
+			completionCache.accountsByProvider.set(
+				provider,
+				authOf(ctx).listOAuthAccounts(provider, ctx.sessionManager.getSessionId()),
+			);
+		} catch {
+			// keep the stale cache
+		}
+	}
+
+	function completeAccountsArgument(argumentPrefix: string): CompletionItem[] | null {
+		const spaceIndex = argumentPrefix.indexOf(" ");
+		if (spaceIndex === -1) {
+			const lower = argumentPrefix.toLowerCase();
+			const matches = SUBCOMMANDS.filter(s => s.name.startsWith(lower)).map(s => ({
+				value: `${s.name} `,
+				label: s.name,
+				description: s.description,
+				hint: s.usage,
+			}));
+			return matches.length > 0 ? matches : null;
+		}
+		const sub = argumentPrefix.slice(0, spaceIndex).toLowerCase();
+		const argPrefix = argumentPrefix.slice(spaceIndex + 1);
+		if (argPrefix.includes(" ")) return null; // complete one argument deep only
+		const lowerArg = argPrefix.toLowerCase();
+
+		if (sub === "rotation") {
+			const modes = [
+				{ name: "on", description: "Pin the account with the most remaining quota each turn" },
+				{ name: "off", description: "Release the pin; native usage-aware rotation applies" },
+				{ name: "status", description: "Show rotation state, hysteresis margin, and active account" },
+			].filter(m => m.name.startsWith(lowerArg));
+			return modes.length > 0
+				? modes.map(m => ({ value: `rotation ${m.name} `, label: m.name, description: m.description }))
+				: null;
+		}
+
+		if (sub === "set" || sub === "logout") {
+			const provider = completionCache.currentProvider;
+			const accounts = provider ? (completionCache.accountsByProvider.get(provider) ?? []) : [];
+			if (accounts.length === 0) return null;
+			const matches = accounts.filter(a => {
+				if (!lowerArg) return true;
+				return (
+					String(a.position + 1).startsWith(lowerArg) ||
+					(a.email?.toLowerCase().includes(lowerArg) ?? false) ||
+					(a.accountId?.toLowerCase().includes(lowerArg) ?? false)
+				);
+			});
+			return matches.length > 0
+				? matches.map(a => ({
+						value: `${sub} ${a.position + 1} `,
+						label: `${a.position + 1}. ${accountLabel(a)}`,
+						description: a.active ? "active" : undefined,
+					}))
+				: null;
+		}
+
+		if (sub === "list" || sub === "login") {
+			const providers = [...completionCache.providers].filter(p => p.startsWith(lowerArg)).sort();
+			return providers.length > 0
+				? providers.map(p => ({
+						value: `${sub} ${p} `,
+						label: p,
+						description: p === completionCache.currentProvider ? "current provider" : undefined,
+					}))
+				: null;
+		}
+
+		return null;
+	}
 
 	function activeIdentityKey(ctx: Ctx, provider: string): string | undefined {
 		const identity = authOf(ctx).getOAuthAccountIdentity(provider, ctx.sessionManager.getSessionId());
@@ -412,14 +533,17 @@ export default function accountsExtension(pi: ExtensionAPI) {
 	// -- events ---------------------------------------------------------------
 
 	pi.on("session_start", async (_event, ctx) => {
+		refreshCompletionCache(ctx);
 		if (ctx.model?.provider) rememberIdentity(ctx, ctx.model.provider);
 	});
 
 	pi.on("session_switch", async (_event, ctx) => {
+		refreshCompletionCache(ctx);
 		if (ctx.model?.provider) rememberIdentity(ctx, ctx.model.provider);
 	});
 
 	pi.on("turn_start", async (_event, ctx) => {
+		refreshCompletionCache(ctx);
 		const provider = ctx.model?.provider;
 		if (!provider) return;
 		detectAccountSwitch(ctx, provider);
@@ -435,7 +559,9 @@ export default function accountsExtension(pi: ExtensionAPI) {
 
 	pi.registerCommand("accounts", {
 		description: "Manage OAuth accounts: list, pin, rotation policy, quota ceilings",
+		getArgumentCompletions: completeAccountsArgument,
 		handler: async (args, ctx) => {
+			refreshCompletionCache(ctx);
 			const [sub = "list", ...rest] = args.trim().split(/\s+/).filter(Boolean);
 			const restArgs = rest.join(" ");
 
@@ -472,10 +598,6 @@ export default function accountsExtension(pi: ExtensionAPI) {
 				}
 
 				case "set": {
-					if (!restArgs.trim()) {
-						say(ctx, "Usage: /accounts set <number|email|account id>", "warning");
-						return;
-					}
 					const provider = ctx.model?.provider;
 					if (!provider) {
 						say(ctx, "Select a model before pinning a provider account.", "warning");
@@ -492,9 +614,28 @@ export default function accountsExtension(pi: ExtensionAPI) {
 						say(ctx, `No stored OAuth accounts for ${provider}. Use /login to add one.`, "warning");
 						return;
 					}
-					const { account, error } = resolveAccount(accounts, restArgs);
-					if (!account) {
-						say(ctx, error ?? "No match.", "warning");
+					let account: OAuthAccountSummary | undefined;
+					if (restArgs.trim()) {
+						const resolved = resolveAccount(accounts, restArgs);
+						if (!resolved.account) {
+							say(ctx, resolved.error ?? "No match.", "warning");
+							return;
+						}
+						account = resolved.account;
+					} else if (ctx.hasUI) {
+						const usage = await usageByCredential(ctx, provider);
+						const picked = await ctx.ui.select(
+							`Pin which ${provider} account to this session?`,
+							accounts.map(a => ({
+								label: `${a.position + 1}. ${accountLabel(a)}`,
+								description: `${a.active ? "active" : "inactive"}${describeUsage(usage?.get(a.credentialId))}`,
+							})),
+						);
+						if (!picked) return;
+						account = accounts[Number.parseInt(picked, 10) - 1];
+						if (!account) return;
+					} else {
+						say(ctx, "Usage: /accounts set <number|email|account id>", "warning");
 						return;
 					}
 					if (!auth.pinSessionOAuthAccount(provider, sessionId, account.credentialId)) {
@@ -507,6 +648,7 @@ export default function accountsExtension(pi: ExtensionAPI) {
 						selfPinnedBySession.set(mapKey, key);
 						lastActiveBySession.set(mapKey, key);
 					}
+					refreshCompletionCache(ctx);
 					say(ctx, `Pinned ${accountLabel(account)} to this session for ${provider}.`);
 					return;
 				}
@@ -647,6 +789,7 @@ export default function accountsExtension(pi: ExtensionAPI) {
 						auth.releaseSessionCredentialForReselection(provider, sessionId);
 					}
 					const removed = await auth.removeCredential(provider, account.credentialId);
+					refreshCompletionCache(ctx);
 					say(
 						ctx,
 						removed

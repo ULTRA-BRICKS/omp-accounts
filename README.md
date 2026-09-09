@@ -54,6 +54,22 @@ OAuth accounts for anthropic:
 Pin one with /accounts set <number|email|account id>.
 ```
 
+## Tab completion & pickers
+
+In interactive mode, `/accounts` completes as you type:
+
+- After `/accounts ` a dropdown lists all subcommands with descriptions; the
+  selected item shows its usage as a dim ghost-hint after the cursor
+  (e.g. `set` → `<n|email|accountId>`).
+- `/accounts set ` and `/accounts logout ` complete account numbers, emails,
+  and account ids of the current provider (the active account is marked).
+- `/accounts rotation ` completes `on` / `off` / `status` with descriptions.
+- `/accounts list ` and `/accounts login ` complete provider names (the
+  current provider is marked).
+- Bare `/accounts set` (no argument) opens an interactive picker with quota
+  state per account — the same picker bare `/accounts logout` offers for
+  removal.
+
 ## Configuration
 
 Config lives in `<agent dir>/accounts.config.json` — the agent dir is

@@ -1,6 +1,6 @@
 {
   "name": "omp-accounts",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "description": "Multi-OAuth-account management for omp: list, pin, quota-aware rotation, per-model ceilings",
   "main": "./index.ts",
