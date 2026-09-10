@@ -5,6 +5,8 @@ import {
 	normalizeRotationPolicy,
 	parseModelFallbackCommand,
 	parseRotationMode,
+	buildSubcommandInlineHint,
+	accountsInlineHint,
 	type OAuthAccountSummary,
 } from "./index.ts";
 
@@ -162,3 +164,18 @@ describe("parseModelFallbackCommand", () => {
 	});
 });
 
+
+
+describe("inline hints", () => {
+	const modelHint = buildSubcommandInlineHint([
+		{ name: "set", description: "set", usage: "<model> <percent> [fallback]" },
+		{ name: "unset", description: "unset", usage: "<model>" },
+	]);
+	test("model-fallback set ghost text", () => {
+		expect(modelHint("se")).toBe("t <model> <percent> [fallback]");
+	});
+	test("accounts ceiling delegates to model-fallback hints", () => {
+		expect(accountsInlineHint("ceiling se")).toBe("t <model> <percent> [fallback]");
+		expect(accountsInlineHint("li")).toBe("st [provider|all]");
+	});
+});

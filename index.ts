@@ -418,6 +418,57 @@ const HELP_TEXT = [
  * Structural mirror of pi-tui's AutocompleteItem. pi-coding-agent imports the
  * type but does not re-export it, and this extension stays self-contained.
  */
+export function buildSubcommandInlineHint(
+	subcommands: SubcommandSpec[],
+): (argumentText: string) => string | null {
+	return (argumentText: string) => {
+		const trimmed = argumentText.trimStart();
+		const spaceIndex = trimmed.indexOf(" ");
+		if (spaceIndex === -1) {
+			const prefix = trimmed.toLowerCase();
+			if (prefix.length === 0) return null;
+			const match = subcommands.find(s => s.name.startsWith(prefix));
+			if (!match) return null;
+			const remaining = match.name.slice(prefix.length);
+			return remaining + (match.usage ? ` ${match.usage}` : "");
+		}
+		const subName = trimmed.slice(0, spaceIndex).toLowerCase();
+		const afterSub = trimmed.slice(spaceIndex + 1);
+		const sub = subcommands.find(s => s.name === subName);
+		if (!sub?.usage) return null;
+		if (afterSub.length > 0) {
+			const usageParts = sub.usage.split(" ");
+			const inputParts = afterSub.trim().split(/\s+/);
+			const remaining = usageParts.slice(inputParts.length);
+			return remaining.length > 0 ? remaining.join(" ") : null;
+		}
+		return sub.usage;
+	};
+}
+
+const MODEL_FALLBACK_SUBCOMMANDS: SubcommandSpec[] = [
+	{ name: "set", description: "Add or update a per-model ceiling rule", usage: "<model> <percent> [fallback]" },
+	{ name: "unset", description: "Remove a ceiling rule for one model", usage: "<model>" },
+	{ name: "status", description: "Show configured ceilings and live quota" },
+	{ name: "help", description: "Command reference" },
+];
+
+const modelFallbackInlineHint = buildSubcommandInlineHint(MODEL_FALLBACK_SUBCOMMANDS);
+
+export function accountsInlineHint(argumentText: string): string | null {
+	const trimmed = argumentText.trimStart();
+	const spaceIndex = trimmed.indexOf(" ");
+	if (spaceIndex === -1) {
+		return buildSubcommandInlineHint(SUBCOMMANDS)(argumentText);
+	}
+	const sub = trimmed.slice(0, spaceIndex).toLowerCase();
+	const rest = trimmed.slice(spaceIndex + 1);
+	if (sub === "ceiling") {
+		return modelFallbackInlineHint(rest);
+	}
+	return buildSubcommandInlineHint(SUBCOMMANDS)(argumentText);
+}
+
 interface CompletionItem {
 	value: string;
 	label: string;
@@ -957,6 +1008,7 @@ export default function accountsExtension(pi: ExtensionAPI) {
 	pi.registerCommand("accounts", {
 		description: "Manage OAuth accounts: list, pin, rotation policy, quota ceilings",
 		getArgumentCompletions: completeAccountsArgument,
+		getInlineHint: accountsInlineHint,
 		handler: async (args, ctx) => {
 			refreshCompletionCache(ctx);
 			const [sub = "list", ...rest] = args.trim().split(/\s+/).filter(Boolean);
@@ -1246,6 +1298,7 @@ export default function accountsExtension(pi: ExtensionAPI) {
 	pi.registerCommand("model-fallback", {
 		description: "Per-model quota ceilings — proactive fallback before hard limits",
 		getArgumentCompletions: completeModelFallbackArgument,
+		getInlineHint: modelFallbackInlineHint,
 		handler: async (args, ctx) => {
 			refreshCompletionCache(ctx);
 			const tokens = args.trim().split(/\s+/).filter(Boolean);
