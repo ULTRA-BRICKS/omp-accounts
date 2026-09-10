@@ -11,7 +11,8 @@ Multi-OAuth-account management for [Oh My Pi](https://github.com/can1357/oh-my-p
 - `/accounts set` / `unset` — pin one account to the session, or hand control back to omp
 - `/accounts rotation smart` — each turn, pin the account with the most remaining quota (10% hysteresis margin)
 - `/accounts rotation default` — built-in omp quota-aware rotation (no extension pinning)
-- `/accounts ceiling set|unset` — per-model quota ceilings with automatic fallback model switching
+- `/model-fallback set|unset|status` — per-model quota ceilings with automatic fallback model switching
+- `/accounts ceiling` — alias for `/model-fallback`
 - Account-switch notifications when omp's native rotation changes the account underneath you
 
 Requires **omp >= 18.1.15**.
@@ -39,9 +40,10 @@ omp plugin link /path/to/omp-accounts
 /accounts set <n|email|accountId>  pin an account to this session
 /accounts unset                    release the pin; built-in omp rotation resumes
 /accounts rotation default|smart|status   rotation policy (persisted)
-/accounts ceiling                  show ceilings + live quota status
-/accounts ceiling set <model> <percent> [fallback]
-/accounts ceiling unset <model>
+/model-fallback                    show ceilings + live quota status
+/model-fallback set <model> <percent> [fallback]
+/model-fallback unset <model>
+/accounts ceiling                    alias for /model-fallback
 /accounts login [provider]         pre-fills /login in the editor
 /accounts logout [n|email|accountId] remove a stored OAuth account
 /accounts help
@@ -61,20 +63,26 @@ Turn3: B(95%) → pin B
 
 **default** — omp's built-in ranker handles rotation; extension does not pin.
 
-### Ceilings
+### Model fallback (ceilings)
 
 ```
-/accounts ceiling set claude-opus-4-6 90 anthropic/claude-sonnet-4-6
+/model-fallback set claude-opus-4-6 90 anthropic/claude-sonnet-4-6
 ```
 
 When the active account passes 90% used on that model, omp switches to the fallback automatically.
+
+`/accounts ceiling …` is an alias with the same grammar.
+
+**Not the same as:**
+- `/accounts rotation` — picks which **OAuth account** to use (quota-aware pin), not which model
+- omp `/model` hub — **reactive** model switching when a request fails or hits limits; `/model-fallback` is **proactive** (switches before hard limits)
 
 ## Tab completion
 
 - Subcommands with use-case descriptions and ghost-hints
 - `/accounts rotation ` → `default`, `smart`, `status`
 - `/accounts list ` → logged-in providers + `all`
-- `/accounts ceiling set ` → models, then percent presets 80/85/90/95
+- `/model-fallback set ` (and `/accounts ceiling set `) → models, then percent presets 80/85/90/95
 - Workaround for omp TUI trailing-space autocomplete gap (see `index.ts` comment citing `packages/tui/src/components/editor.ts`)
 
 ## Configuration
@@ -95,7 +103,7 @@ File: `<agent dir>/accounts.config.json` (`$PI_CODING_AGENT_DIR` or `~/.omp/agen
 }
 ```
 
-Prefer `/accounts rotation` and `/accounts ceiling set` over hand-editing the file.
+Prefer `/accounts rotation` and `/model-fallback set` over hand-editing the file.
 
 ## Identity labels
 

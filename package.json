@@ -1,6 +1,6 @@
 {
   "name": "omp-accounts",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "type": "module",
   "description": "Multi-OAuth-account management for omp: list, pin, rotation policies (default|smart), per-model ceilings",
   "main": "./index.ts",
