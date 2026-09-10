@@ -3,6 +3,7 @@ import {
 	accountLabel,
 	decideRotation,
 	normalizeRotationPolicy,
+	parseModelFallbackCommand,
 	parseRotationMode,
 	type OAuthAccountSummary,
 } from "./index.ts";
@@ -113,3 +114,51 @@ describe("decideRotation", () => {
 		expect(decideRotation(active, best, 0.1).pin).toBe(false);
 	});
 });
+
+describe("parseModelFallbackCommand", () => {
+	test("bare tokens return status", () => {
+		expect(parseModelFallbackCommand([])).toEqual({ kind: "status" });
+	});
+
+	test("status and help verbs", () => {
+		expect(parseModelFallbackCommand(["status"])).toEqual({ kind: "status" });
+		expect(parseModelFallbackCommand(["help"])).toEqual({ kind: "help" });
+	});
+
+	test("set parses model, percent, and optional fallback", () => {
+		expect(parseModelFallbackCommand(["set", "claude-opus-4-6", "90", "anthropic/claude-sonnet-4-6"])).toEqual({
+			kind: "set",
+			modelKey: "claude-opus-4-6",
+			percent: 90,
+			fallback: "anthropic/claude-sonnet-4-6",
+		});
+	});
+
+	test("set without fallback", () => {
+		expect(parseModelFallbackCommand(["set", "gpt-5", "85"])).toEqual({
+			kind: "set",
+			modelKey: "gpt-5",
+			percent: 85,
+			fallback: undefined,
+		});
+	});
+
+	test("set rejects missing args and invalid percent", () => {
+		expect(parseModelFallbackCommand(["set", "model-only"]).kind).toBe("error");
+		expect(parseModelFallbackCommand(["set", "m", "0"]).kind).toBe("error");
+		expect(parseModelFallbackCommand(["set", "m", "101"]).kind).toBe("error");
+	});
+
+	test("unset requires model key", () => {
+		expect(parseModelFallbackCommand(["unset", "claude-opus-4-6"])).toEqual({
+			kind: "unset",
+			modelKey: "claude-opus-4-6",
+		});
+		expect(parseModelFallbackCommand(["unset"]).kind).toBe("error");
+	});
+
+	test("unknown action is error", () => {
+		expect(parseModelFallbackCommand(["nope"]).kind).toBe("error");
+	});
+});
+

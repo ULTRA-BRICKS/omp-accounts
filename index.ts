@@ -295,6 +295,63 @@ const CEILING_ASCII = [
 	"  opus:  █████████░ 92% used → switch to sonnet",
 	"  sonnet: ████░░░░░░ 40% used → stay",
 ].join("\n");
+
+export type ModelFallbackParse =
+	| { kind: "status" }
+	| { kind: "help" }
+	| { kind: "set"; modelKey: string; percent: number; fallback?: string }
+	| { kind: "unset"; modelKey: string }
+	| { kind: "error"; message: string };
+
+export const MODEL_FALLBACK_HELP_TEXT = [
+	"Per-model quota ceilings — switch to a fallback model before hard limits.",
+	"",
+	"/model-fallback set <model> <percent> [fallback] — add or update a rule",
+	"/model-fallback unset <model> — remove a rule",
+	"/model-fallback status — show configured rules and live quota",
+	"/model-fallback help — this reference",
+	"",
+	"Alias: /accounts ceiling … (same behavior)",
+	"",
+	CEILING_ASCII,
+].join("\n");
+
+/** Parse tokens after /model-fallback or /accounts ceiling (bare = status). */
+export function parseModelFallbackCommand(tokens: string[]): ModelFallbackParse {
+	const [action, ...rest] = tokens;
+	if (!action) return { kind: "status" };
+	const verb = action.toLowerCase();
+	if (verb === "help") return { kind: "help" };
+	if (verb === "status") return { kind: "status" };
+	if (verb === "set") {
+		const [modelKey, percentStr, ...fallbackParts] = rest;
+		if (!modelKey || !percentStr) {
+			return {
+				kind: "error",
+				message:
+					"Usage: set <model> <percent> [fallback]\nExample: set claude-opus-4-6 90 anthropic/claude-sonnet-4-6",
+			};
+		}
+		const percent = Number.parseFloat(percentStr);
+		if (!Number.isFinite(percent) || percent <= 0 || percent > 100) {
+			return { kind: "error", message: "Percent must be a number between 1 and 100 (quota used before switching)." };
+		}
+		const fallback = fallbackParts.join(" ").trim() || undefined;
+		return { kind: "set", modelKey, percent, fallback };
+	}
+	if (verb === "unset") {
+		const modelKey = rest.join(" ").trim();
+		if (!modelKey) {
+			return { kind: "error", message: "Usage: unset <model>" };
+		}
+		return { kind: "unset", modelKey };
+	}
+	return {
+		kind: "error",
+		message: `Unknown action "${action}". Use set, unset, status, help, or bare command for status.`,
+	};
+}
+
 function resolveAccount(
 	accounts: OAuthAccountSummary[],
 	selector: string,
@@ -339,7 +396,7 @@ const SUBCOMMANDS: SubcommandSpec[] = [
 	{ name: "rotation", description: "Rotation policy: default (built-in omp) or smart (max remaining quota)", usage: "default|smart|status" },
 	{ name: "login", description: "Start OAuth login — pre-fills /login so you only press Enter", usage: "[provider]" },
 	{ name: "logout", description: "Remove a stored OAuth account from disk (interactive picker without args)", usage: "[n|email|accountId]" },
-	{ name: "ceiling", description: "Per-model quota ceilings — switch to a fallback model before hard limits", usage: "set <model> <percent> [fallback] | unset <model>" },
+	{ name: "ceiling", description: "Alias for /model-fallback — per-model quota ceilings with automatic fallback switching", usage: "set <model> <percent> [fallback] | unset <model>" },
 	{ name: "help", description: "Show command reference with use cases" },
 ];
 
@@ -352,6 +409,7 @@ const HELP_TEXT = [
 	"",
 	CEILING_ASCII,
 	"",
+	"Prefer /model-fallback for ceilings; /accounts ceiling is an alias.",
 	"Tab-completion: subcommands, accounts for set|logout, default|smart|status for rotation.",
 	"Providers with stored OAuth accounts + 'all' for list.",
 ].join("\n");
@@ -508,32 +566,9 @@ export default function accountsExtension(pi: ExtensionAPI) {
 				: null;
 		}
 		if (sub === "ceiling") {
-			if (!lowerArg) {
-				return [
-					{ value: "ceiling set ", label: "set", description: "Add or update a per-model ceiling rule" },
-					{ value: "ceiling unset ", label: "unset", description: "Remove a ceiling rule for one model" },
-				];
-			}
-			if (lowerArg.startsWith("set")) {
-				const rest = argPrefix.slice(3).trimStart();
-				const parts = rest.split(/\s+/).filter(Boolean);
-				if (parts.length === 0) {
-					return cache.modelIds.map(id => ({ value: `ceiling set ${id} `, label: id, description: "model to cap" }));
-				}
-				if (parts.length === 1) {
-					return ["80", "85", "90", "95"].map(p => ({
-						value: `ceiling set ${parts[0]} ${p} `,
-						label: `${p}%`,
-						description: `switch when > ${p}% of quota is used`,
-					}));
-				}
-			}
-			if (lowerArg.startsWith("unset")) {
-				const modelPart = argPrefix.slice(5).trimStart().toLowerCase();
-				return cache.modelIds
-					.filter(id => !modelPart || id.toLowerCase().includes(modelPart))
-					.map(id => ({ value: `ceiling unset ${id} `, label: id, description: "remove ceiling" }));
-			}
+			const nested = completeModelFallbackArgs(argPrefix, cache);
+			if (!nested) return null;
+			return nested.map(item => ({ ...item, value: `ceiling ${item.value}` }));
 		}
 		if (sub === "list") {
 			const providers = ["all", ...cache.loggedInProviders].filter(p => p.startsWith(lowerArg)).sort();
@@ -553,6 +588,47 @@ export default function accountsExtension(pi: ExtensionAPI) {
 		}
 		return null;
 	}
+
+	function completeModelFallbackArgs(
+		argPrefix: string,
+		cache: { modelIds: string[] },
+	): CompletionItem[] | null {
+		const lowerArg = argPrefix.toLowerCase();
+		if (!lowerArg) {
+			return [
+				{ value: "set ", label: "set", description: "Add or update a per-model ceiling rule" },
+				{ value: "unset ", label: "unset", description: "Remove a ceiling rule for one model" },
+				{ value: "status ", label: "status", description: "Show configured ceilings and live quota" },
+				{ value: "help ", label: "help", description: "Command reference" },
+			];
+		}
+		if (lowerArg.startsWith("set")) {
+			const rest = argPrefix.slice(3).trimStart();
+			const parts = rest.split(/\s+/).filter(Boolean);
+			if (parts.length === 0) {
+				return cache.modelIds.map(id => ({ value: `set ${id} `, label: id, description: "model to cap" }));
+			}
+			if (parts.length === 1) {
+				return ["80", "85", "90", "95"].map(p => ({
+					value: `set ${parts[0]} ${p} `,
+					label: `${p}%`,
+					description: `switch when > ${p}% of quota is used`,
+				}));
+			}
+		}
+		if (lowerArg.startsWith("unset")) {
+			const modelPart = argPrefix.slice(5).trimStart().toLowerCase();
+			return cache.modelIds
+				.filter(id => !modelPart || id.toLowerCase().includes(modelPart))
+				.map(id => ({ value: `unset ${id} `, label: id, description: "remove ceiling" }));
+		}
+		return null;
+	}
+
+	function completeModelFallbackArgument(argumentPrefix: string): CompletionItem[] | null {
+		return completeModelFallbackArgs(argumentPrefix, completionCache);
+	}
+
 
 	function completeAccountsArgument(argumentPrefix: string): CompletionItem[] | null {
 		const spaceIndex = argumentPrefix.indexOf(" ");
@@ -752,7 +828,7 @@ export default function accountsExtension(pi: ExtensionAPI) {
 	async function showCeilingStatus(ctx: Ctx): Promise<void> {
 		const lines = [
 			"Per-model quota ceilings — switch to a cheaper/fallback model before you hit hard limits.",
-			"Use: /accounts ceiling set <model> <percent> [fallback]  |  unset <model>",
+			"Use: /model-fallback set <model> <percent> [fallback]  |  unset <model>  (alias: /accounts ceiling …)",
 			"",
 			CEILING_ASCII,
 			"",
@@ -760,7 +836,7 @@ export default function accountsExtension(pi: ExtensionAPI) {
 		const entries = Object.entries(config.models);
 		if (entries.length === 0) {
 			lines.push("No ceilings configured yet. Example:");
-			lines.push("  /accounts ceiling set claude-opus-4-6 90 anthropic/claude-sonnet-4-6");
+			lines.push("  /model-fallback set claude-opus-4-6 90 anthropic/claude-sonnet-4-6");
 			say(ctx, lines.join("\n"));
 			return;
 		}
@@ -793,6 +869,63 @@ export default function accountsExtension(pi: ExtensionAPI) {
 		lines.push("", `Persisted in ${CONFIG_PATH}`);
 		say(ctx, lines.join("\n"));
 	}
+
+	async function handleModelFallbackCommand(ctx: Ctx, tokens: string[], commandPath: string): Promise<void> {
+		const parsed = parseModelFallbackCommand(tokens);
+		switch (parsed.kind) {
+			case "status":
+				await showCeilingStatus(ctx);
+				return;
+			case "help":
+				say(ctx, MODEL_FALLBACK_HELP_TEXT);
+				return;
+			case "set": {
+				config.models[parsed.modelKey] = { maxUsedFraction: parsed.percent / 100, fallback: parsed.fallback };
+				try {
+					saveConfig(config);
+				} catch (error) {
+					say(
+						ctx,
+						`Failed to persist ${CONFIG_PATH}: ${error instanceof Error ? error.message : error}`,
+						"error",
+					);
+					return;
+				}
+				say(
+					ctx,
+					`Ceiling set: ${parsed.modelKey} switches at > ${parsed.percent}% used${parsed.fallback ? ` → ${parsed.fallback}` : " (no fallback model — add one to enable auto-switch)"}.`,
+				);
+				return;
+			}
+			case "unset": {
+				if (!config.models[parsed.modelKey]) {
+					say(ctx, `No ceiling configured for ${parsed.modelKey}.`, "warning");
+					return;
+				}
+				delete config.models[parsed.modelKey];
+				try {
+					saveConfig(config);
+				} catch (error) {
+					say(
+						ctx,
+						`Failed to persist ${CONFIG_PATH}: ${error instanceof Error ? error.message : error}`,
+						"error",
+					);
+					return;
+				}
+				say(ctx, `Ceiling removed for ${parsed.modelKey}.`);
+				return;
+			}
+			case "error":
+				say(
+					ctx,
+					`${parsed.message.replace(/^Usage: /, `Usage: ${commandPath} `)}`,
+					"warning",
+				);
+				return;
+		}
+	}
+
 
 	// -- events ---------------------------------------------------------------
 
@@ -1096,69 +1229,7 @@ export default function accountsExtension(pi: ExtensionAPI) {
 				}
 
 				case "ceiling": {
-					const [action, ...ceilingRest] = rest;
-					if (!action) {
-						await showCeilingStatus(ctx);
-						return;
-					}
-					if (action === "set") {
-						const [modelKey, percentStr, ...fallbackParts] = ceilingRest;
-						if (!modelKey || !percentStr) {
-							say(
-								ctx,
-								"Usage: /accounts ceiling set <model> <percent> [fallback]\nExample: /accounts ceiling set claude-opus-4-6 90 anthropic/claude-sonnet-4-6",
-								"warning",
-							);
-							return;
-						}
-						const percent = Number.parseFloat(percentStr);
-						if (!Number.isFinite(percent) || percent <= 0 || percent > 100) {
-							say(ctx, "Percent must be a number between 1 and 100 (quota used before switching).", "warning");
-							return;
-						}
-						const fallback = fallbackParts.join(" ").trim() || undefined;
-						config.models[modelKey] = { maxUsedFraction: percent / 100, fallback };
-						try {
-							saveConfig(config);
-						} catch (error) {
-							say(
-								ctx,
-								`Failed to persist ${CONFIG_PATH}: ${error instanceof Error ? error.message : error}`,
-								"error",
-							);
-							return;
-						}
-						say(
-							ctx,
-							`Ceiling set: ${modelKey} switches at > ${percent}% used${fallback ? ` → ${fallback}` : " (no fallback model — add one to enable auto-switch)"}.`,
-						);
-						return;
-					}
-					if (action === "unset") {
-						const modelKey = ceilingRest.join(" ").trim();
-						if (!modelKey) {
-							say(ctx, "Usage: /accounts ceiling unset <model>", "warning");
-							return;
-						}
-						if (!config.models[modelKey]) {
-							say(ctx, `No ceiling configured for ${modelKey}.`, "warning");
-							return;
-						}
-						delete config.models[modelKey];
-						try {
-							saveConfig(config);
-						} catch (error) {
-							say(
-								ctx,
-								`Failed to persist ${CONFIG_PATH}: ${error instanceof Error ? error.message : error}`,
-								"error",
-							);
-							return;
-						}
-						say(ctx, `Ceiling removed for ${modelKey}.`);
-						return;
-					}
-					say(ctx, `Unknown ceiling action "${action}". Use set, unset, or bare /accounts ceiling.`, "warning");
+					await handleModelFallbackCommand(ctx, rest, "/accounts ceiling");
 					return;
 				}
 
@@ -1169,6 +1240,16 @@ export default function accountsExtension(pi: ExtensionAPI) {
 				default:
 					say(ctx, `Unknown subcommand "${sub}".\n${HELP_TEXT}`, "warning");
 			}
+		},
+	});
+
+	pi.registerCommand("model-fallback", {
+		description: "Per-model quota ceilings — proactive fallback before hard limits",
+		getArgumentCompletions: completeModelFallbackArgument,
+		handler: async (args, ctx) => {
+			refreshCompletionCache(ctx);
+			const tokens = args.trim().split(/\s+/).filter(Boolean);
+			await handleModelFallbackCommand(ctx, tokens, "/model-fallback");
 		},
 	});
 }
