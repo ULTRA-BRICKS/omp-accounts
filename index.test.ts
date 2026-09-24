@@ -4,6 +4,8 @@ import {
 	decideRotation,
 	normalizeRotationPolicy,
 	parseModelFallbackCommand,
+	mergeModelFallbackRule,
+	type ModelFallbackSetParse,
 	parseRotationMode,
 	buildSubcommandInlineHint,
 	accountsInlineHint,
@@ -151,6 +153,12 @@ describe("parseModelFallbackCommand", () => {
 		expect(parseModelFallbackCommand(["set", "m", "101"]).kind).toBe("error");
 	});
 
+	test("set rejects a percent with trailing garbage instead of silently truncating it", () => {
+		expect(parseModelFallbackCommand(["set", "m", "90abc"]).kind).toBe("error");
+		expect(parseModelFallbackCommand(["set", "m", "90%"]).kind).toBe("error");
+		expect(parseModelFallbackCommand(["set", "m", "90,"]).kind).toBe("error");
+	});
+
 	test("unset requires model key", () => {
 		expect(parseModelFallbackCommand(["unset", "claude-opus-4-6"])).toEqual({
 			kind: "unset",
@@ -161,6 +169,38 @@ describe("parseModelFallbackCommand", () => {
 
 	test("unknown action is error", () => {
 		expect(parseModelFallbackCommand(["nope"]).kind).toBe("error");
+	});
+});
+
+/** Parses a `set` command and narrows to the `set` variant, failing loudly if parsing didn't produce one. */
+function parseSet(...tokens: string[]): ModelFallbackSetParse {
+	const parsed = parseModelFallbackCommand(["set", ...tokens]);
+	if (parsed.kind !== "set") throw new Error("test setup failed");
+	return parsed;
+}
+
+describe("mergeModelFallbackRule", () => {
+	test("a bare set with no fallback token keeps a previously configured fallback", () => {
+		const existing = { maxUsedFraction: 0.9, fallback: "anthropic/claude-sonnet-4-6" };
+		expect(mergeModelFallbackRule(existing, parseSet("claude-opus-4-6", "95"))).toEqual({
+			maxUsedFraction: 0.95,
+			fallback: "anthropic/claude-sonnet-4-6",
+		});
+	});
+
+	test("supplying a new fallback token replaces the previous one", () => {
+		const existing = { maxUsedFraction: 0.9, fallback: "anthropic/claude-sonnet-4-6" };
+		expect(mergeModelFallbackRule(existing, parseSet("claude-opus-4-6", "95", "gpt-5"))).toEqual({
+			maxUsedFraction: 0.95,
+			fallback: "gpt-5",
+		});
+	});
+
+	test("first set for a model with no fallback token has no fallback", () => {
+		expect(mergeModelFallbackRule(undefined, parseSet("claude-opus-4-6", "90"))).toEqual({
+			maxUsedFraction: 0.9,
+			fallback: undefined,
+		});
 	});
 });
 

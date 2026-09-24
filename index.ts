@@ -71,7 +71,7 @@ interface AuthStorageLike {
 // or ~/.omp/agent.
 // ---------------------------------------------------------------------------
 
-interface ModelCeilingRule {
+export interface ModelCeilingRule {
 	/** Switch away when the active account's used fraction exceeds this (0..1). Default 0.9. */
 	maxUsedFraction: number;
 	/** Fallback model spec ("provider/model-id" or bare id) to switch to. */
@@ -307,9 +307,10 @@ export const MODEL_FALLBACK_HELP_TEXT = [
 	"Per-model quota ceilings — switch to a fallback model before hard limits.",
 	"",
 	"/model-fallback set <model> <percent> [fallback] — add or update a rule",
+	"  Omitting [fallback] on an existing rule keeps its configured fallback model;",
+	"  to drop a fallback entirely, unset the rule and set it again.",
 	"/model-fallback unset <model> — remove a rule",
 	"/model-fallback status — show configured rules and live quota",
-	"/model-fallback help — this reference",
 	"",
 	"Alias: /accounts ceiling … (same behavior)",
 	"",
@@ -332,10 +333,13 @@ export function parseModelFallbackCommand(tokens: string[]): ModelFallbackParse 
 					"Usage: set <model> <percent> [fallback]\nExample: set claude-opus-4-6 90 anthropic/claude-sonnet-4-6",
 			};
 		}
+		const percentError = {
+			kind: "error" as const,
+			message: "Percent must be a number greater than 0 and at most 100 (quota used before switching).",
+		};
+		if (!/^\d+(\.\d+)?$/.test(percentStr)) return percentError;
 		const percent = Number.parseFloat(percentStr);
-		if (!Number.isFinite(percent) || percent <= 0 || percent > 100) {
-			return { kind: "error", message: "Percent must be a number between 1 and 100 (quota used before switching)." };
-		}
+		if (percent <= 0 || percent > 100) return percentError;
 		const fallback = fallbackParts.join(" ").trim() || undefined;
 		return { kind: "set", modelKey, percent, fallback };
 	}
@@ -350,6 +354,22 @@ export function parseModelFallbackCommand(tokens: string[]): ModelFallbackParse 
 		kind: "error",
 		message: `Unknown action "${action}". Use set, unset, status, help, or bare command for status.`,
 	};
+}
+
+/** Narrowed `set` result, named so callers don't repeat the `Extract<...>` inline. */
+export type ModelFallbackSetParse = Extract<ModelFallbackParse, { kind: "set" }>;
+
+/**
+ * Compute the stored rule for a `set` command: a bare `set <model> <percent>`
+ * (no fallback token) updates only the threshold and keeps whatever fallback
+ * model an earlier `set` already configured, rather than silently clearing it.
+ * The only way to drop a fallback entirely is `unset` followed by a fresh `set`.
+ */
+export function mergeModelFallbackRule(
+	existing: ModelCeilingRule | undefined,
+	parsed: ModelFallbackSetParse,
+): ModelCeilingRule {
+	return { maxUsedFraction: parsed.percent / 100, fallback: parsed.fallback ?? existing?.fallback };
 }
 
 function resolveAccount(
@@ -931,7 +951,8 @@ export default function accountsExtension(pi: ExtensionAPI) {
 				say(ctx, MODEL_FALLBACK_HELP_TEXT);
 				return;
 			case "set": {
-				config.models[parsed.modelKey] = { maxUsedFraction: parsed.percent / 100, fallback: parsed.fallback };
+				const rule = mergeModelFallbackRule(config.models[parsed.modelKey], parsed);
+				config.models[parsed.modelKey] = rule;
 				try {
 					saveConfig(config);
 				} catch (error) {
@@ -944,7 +965,7 @@ export default function accountsExtension(pi: ExtensionAPI) {
 				}
 				say(
 					ctx,
-					`Ceiling set: ${parsed.modelKey} switches at > ${parsed.percent}% used${parsed.fallback ? ` → ${parsed.fallback}` : " (no fallback model — add one to enable auto-switch)"}.`,
+					`Ceiling set: ${parsed.modelKey} switches at > ${parsed.percent}% used${rule.fallback ? ` → ${rule.fallback}` : " (no fallback model — add one to enable auto-switch)"}.`,
 				);
 				return;
 			}
