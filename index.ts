@@ -10,8 +10,9 @@
  * session's active account changes underneath you (native auto-rotation).
  *
  * Configuration lives in <agent dir>/accounts.config.json (see CONFIG_PATH below).
- * Runtime requirements: omp >= 18.1.15 (AuthStorage.listOAuthAccounts /
- * pinSessionOAuthAccount / releaseSessionCredentialForReselection / getModelUsageHealth).
+ * Runtime requirements: omp >= 18.3.0, whose AuthStorage exposes the namespaced
+ * facade (.oauth / .sessions / .health / .credentials / .keys) instead of the
+ * pre-refactor flat methods (listOAuthAccounts, getModelUsageHealth, etc.).
  */
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import os from "node:os";
@@ -49,20 +50,31 @@ interface ModelUsageHealth {
 }
 
 interface AuthStorageLike {
-	listOAuthAccounts(provider: string, sessionId?: string): OAuthAccountSummary[];
-	pinSessionOAuthAccount(provider: string, sessionId: string, credentialId: number): boolean;
-	releaseSessionCredentialForReselection(provider: string, sessionId: string): boolean;
-	getOAuthAccountIdentity(
-		provider: string,
-		sessionId?: string,
-	): { accountId?: string; email?: string; projectId?: string; orgName?: string } | undefined;
-	getModelUsageHealth(
-		provider: string,
-		options: { modelId?: string; sessionId?: string; baseUrl?: string; reserveFraction: number },
-	): Promise<ModelUsageHealth>;
-	removeCredential(provider: string, credentialId: number): Promise<boolean>;
-	describeCredentialSource?(provider: string, sessionId?: string): string | undefined;
-	list?(): string[];
+	oauth: {
+		accounts(provider: string, sessionId?: string): OAuthAccountSummary[];
+		identity(
+			provider: string,
+			sessionId?: string,
+		): { accountId?: string; email?: string; projectId?: string; orgName?: string } | undefined;
+	};
+	sessions: {
+		pin(provider: string, sessionId: string, credentialId: number): boolean;
+		release(provider: string, sessionId: string): boolean;
+	};
+	health: {
+		model(
+			provider: string,
+			options: { modelId?: string; sessionId?: string; baseUrl?: string; reserveFraction: number },
+		): Promise<ModelUsageHealth>;
+	};
+	credentials: {
+		removeById(provider: string, credentialId: number): Promise<boolean>;
+		/** Provider name -> credential entry/entries (AuthStorageData), i.e. keyed by provider, not credential id. */
+		all(): Record<string, unknown>;
+	};
+	keys: {
+		describe?(provider: string, sessionId?: string): string | undefined;
+	};
 }
 
 // ---------------------------------------------------------------------------
@@ -82,7 +94,7 @@ export type RotationPolicy = "default" | "smart";
 
 interface AccountsConfig {
 	rotationPolicy: RotationPolicy;
-	/** Reserve fraction passed to getModelUsageHealth. Default 0.1. */
+	/** Reserve fraction passed to health.model. Default 0.1. */
 	reserveFraction: number;
 	/**
 	 * Hysteresis margin for rotation: re-pin only when the best account's
@@ -261,7 +273,8 @@ function providersWithStoredAccounts(ctx: Ctx, auth: AuthStorageLike): string[] 
 		// best-effort
 	}
 	try {
-		for (const p of auth.list?.() ?? []) providers.add(p);
+		// Object.keys only — the values are full credential rows (tokens/api keys); never read/log/return them.
+		for (const p of Object.keys(auth.credentials.all())) providers.add(p);
 	} catch {
 		// best-effort
 	}
@@ -269,7 +282,7 @@ function providersWithStoredAccounts(ctx: Ctx, auth: AuthStorageLike): string[] 
 	const result: string[] = [];
 	for (const provider of providers) {
 		try {
-			if (auth.listOAuthAccounts(provider, sessionId).length > 0) result.push(provider);
+			if (auth.oauth.accounts(provider, sessionId).length > 0) result.push(provider);
 		} catch {
 			// skip
 		}
@@ -622,7 +635,7 @@ export default function accountsExtension(pi: ExtensionAPI) {
 		try {
 			completionCache.accountsByProvider.set(
 				provider,
-				auth.listOAuthAccounts(provider, ctx.sessionManager.getSessionId()),
+				auth.oauth.accounts(provider, ctx.sessionManager.getSessionId()),
 			);
 		} catch {
 			// keep the stale cache
@@ -761,7 +774,7 @@ export default function accountsExtension(pi: ExtensionAPI) {
 	}
 
 	function activeIdentityKey(ctx: Ctx, provider: string): string | undefined {
-		const identity = authOf(ctx).getOAuthAccountIdentity(provider, ctx.sessionManager.getSessionId());
+		const identity = authOf(ctx).oauth.identity(provider, ctx.sessionManager.getSessionId());
 		return identity ? (identity.email ?? identity.accountId) : undefined;
 	}
 
@@ -791,7 +804,7 @@ export default function accountsExtension(pi: ExtensionAPI) {
 	): Promise<Map<number, ModelUsageAccountHealth> | undefined> {
 		const model = ctx.model;
 		try {
-			const health = await authOf(ctx).getModelUsageHealth(provider, {
+			const health = await authOf(ctx).health.model(provider, {
 				modelId: model?.id,
 				baseUrl: model?.baseUrl,
 				sessionId: ctx.sessionManager.getSessionId(),
@@ -807,7 +820,7 @@ export default function accountsExtension(pi: ExtensionAPI) {
 	async function applyRotation(ctx: Ctx, provider: string, reason: string): Promise<void> {
 		const sessionId = ctx.sessionManager.getSessionId();
 		const auth = authOf(ctx);
-		const accounts = auth.listOAuthAccounts(provider, sessionId);
+		const accounts = auth.oauth.accounts(provider, sessionId);
 		if (accounts.length < 2) return;
 		const usage = await usageByCredential(ctx, provider);
 		if (!usage) return;
@@ -828,7 +841,7 @@ export default function accountsExtension(pi: ExtensionAPI) {
 		const active = accounts.find(a => a.active);
 		const verdict = decideRotation(active ? usage.get(active.credentialId) : undefined, bestEntry, config.rotationMargin);
 		if (!verdict.pin) return;
-		if (!auth.pinSessionOAuthAccount(provider, sessionId, best.credentialId)) return;
+		if (!auth.sessions.pin(provider, sessionId, best.credentialId)) return;
 		const bestKey = best.email ?? best.accountId;
 		if (bestKey) {
 			const key = `${sessionId}:${provider}`;
@@ -850,7 +863,7 @@ export default function accountsExtension(pi: ExtensionAPI) {
 		if (!rule?.fallback) return;
 		let health: ModelUsageHealth;
 		try {
-			health = await authOf(ctx).getModelUsageHealth(model.provider, {
+			health = await authOf(ctx).health.model(model.provider, {
 				modelId: model.id,
 				baseUrl: model.baseUrl,
 				sessionId: ctx.sessionManager.getSessionId(),
@@ -891,9 +904,9 @@ export default function accountsExtension(pi: ExtensionAPI) {
 	async function formatProviderList(ctx: Ctx, provider: string): Promise<string[]> {
 		const auth = authOf(ctx);
 		const sessionId = ctx.sessionManager.getSessionId();
-		const accounts = auth.listOAuthAccounts(provider, sessionId);
+		const accounts = auth.oauth.accounts(provider, sessionId);
 		if (accounts.length === 0) {
-			const source = auth.describeCredentialSource?.(provider, sessionId);
+			const source = auth.keys.describe?.(provider, sessionId);
 			return source
 				? [`No stored OAuth accounts for ${provider}. Current auth comes from ${source}.`]
 				: [`No stored OAuth accounts for ${provider}. Use /login to add one.`];
@@ -930,7 +943,7 @@ export default function accountsExtension(pi: ExtensionAPI) {
 			let live = "";
 			if (resolved) {
 				try {
-					const health = await authOf(ctx).getModelUsageHealth(resolved.provider, {
+					const health = await authOf(ctx).health.model(resolved.provider, {
 						modelId: resolved.id,
 						baseUrl: resolved.baseUrl,
 						sessionId: ctx.sessionManager.getSessionId(),
@@ -1077,7 +1090,7 @@ export default function accountsExtension(pi: ExtensionAPI) {
 
 					const loggedIn = providersWithStoredAccounts(ctx, auth);
 					if (loggedIn.length === 0) {
-						const source = auth.describeCredentialSource?.(currentProvider, ctx.sessionManager.getSessionId());
+						const source = auth.keys.describe?.(currentProvider, ctx.sessionManager.getSessionId());
 						say(
 							ctx,
 							source
@@ -1091,7 +1104,7 @@ export default function accountsExtension(pi: ExtensionAPI) {
 					if (loggedIn.includes(currentProvider)) {
 						lines.push(...(await formatProviderList(ctx, currentProvider)));
 					} else {
-						const source = auth.describeCredentialSource?.(currentProvider, ctx.sessionManager.getSessionId());
+						const source = auth.keys.describe?.(currentProvider, ctx.sessionManager.getSessionId());
 						lines.push(
 							source
 								? `No stored OAuth accounts for ${currentProvider}. Current auth comes from ${source}.`
@@ -1104,7 +1117,7 @@ export default function accountsExtension(pi: ExtensionAPI) {
 						lines.push("", "Other providers with stored accounts (use /accounts list all to expand):");
 						const sessionId = ctx.sessionManager.getSessionId();
 						for (const p of others) {
-							const count = auth.listOAuthAccounts(p, sessionId).length;
+							const count = auth.oauth.accounts(p, sessionId).length;
 							lines.push(`- ${p}: ${count} stored account${count === 1 ? "" : "s"}`);
 						}
 					}
@@ -1123,7 +1136,7 @@ export default function accountsExtension(pi: ExtensionAPI) {
 					}
 					const auth = authOf(ctx);
 					const sessionId = ctx.sessionManager.getSessionId();
-					const accounts = auth.listOAuthAccounts(provider, sessionId);
+					const accounts = auth.oauth.accounts(provider, sessionId);
 					if (accounts.length === 0) {
 						say(ctx, `No stored OAuth accounts for ${provider}. Use /login to add one.`, "warning");
 						return;
@@ -1152,7 +1165,7 @@ export default function accountsExtension(pi: ExtensionAPI) {
 						say(ctx, "Usage: /accounts set <number|email|account id>", "warning");
 						return;
 					}
-					if (!auth.pinSessionOAuthAccount(provider, sessionId, account.credentialId)) {
+					if (!auth.sessions.pin(provider, sessionId, account.credentialId)) {
 						say(ctx, `${accountLabel(account)} is no longer available to pin.`, "error");
 						return;
 					}
@@ -1174,10 +1187,7 @@ export default function accountsExtension(pi: ExtensionAPI) {
 						say(ctx, "Select a model first.", "warning");
 						return;
 					}
-					const released = authOf(ctx).releaseSessionCredentialForReselection(
-						provider,
-						ctx.sessionManager.getSessionId(),
-					);
+					const released = authOf(ctx).sessions.release(provider, ctx.sessionManager.getSessionId());
 					say(
 						ctx,
 						released
@@ -1192,7 +1202,7 @@ export default function accountsExtension(pi: ExtensionAPI) {
 					if (mode === "status" || mode === "") {
 						const provider = ctx.model?.provider;
 						const identity = provider
-							? authOf(ctx).getOAuthAccountIdentity(provider, ctx.sessionManager.getSessionId())
+							? authOf(ctx).oauth.identity(provider, ctx.sessionManager.getSessionId())
 							: undefined;
 						say(ctx, rotationStatusText(config, identity));
 						return;
@@ -1218,7 +1228,7 @@ export default function accountsExtension(pi: ExtensionAPI) {
 					const provider = ctx.model?.provider;
 					if (config.rotationPolicy === "default") {
 						if (provider) {
-							authOf(ctx).releaseSessionCredentialForReselection(provider, ctx.sessionManager.getSessionId());
+							authOf(ctx).sessions.release(provider, ctx.sessionManager.getSessionId());
 						}
 						say(ctx, "Rotation: default (built-in omp). Released any pin.");
 						return;
@@ -1262,7 +1272,7 @@ export default function accountsExtension(pi: ExtensionAPI) {
 					}
 					const auth = authOf(ctx);
 					const sessionId = ctx.sessionManager.getSessionId();
-					const accounts = auth.listOAuthAccounts(provider, sessionId);
+					const accounts = auth.oauth.accounts(provider, sessionId);
 					if (accounts.length === 0) {
 						say(ctx, `No stored OAuth accounts for ${provider}.`, "warning");
 						return;
@@ -1295,9 +1305,9 @@ export default function accountsExtension(pi: ExtensionAPI) {
 						if (!confirmed) return;
 					}
 					if (account.active) {
-						auth.releaseSessionCredentialForReselection(provider, sessionId);
+						auth.sessions.release(provider, sessionId);
 					}
-					const removed = await auth.removeCredential(provider, account.credentialId);
+					const removed = await auth.credentials.removeById(provider, account.credentialId);
 					refreshCompletionCache(ctx);
 					say(
 						ctx,

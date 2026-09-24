@@ -15,7 +15,7 @@ Multi-OAuth-account management for [Oh My Pi](https://github.com/can1357/oh-my-p
 - `/accounts ceiling` — alias for `/model-fallback`
 - Account-switch notifications when omp's native rotation changes the account underneath you
 
-Requires **omp >= 18.1.15**.
+Requires **omp >= 18.3.0** (needs the namespaced `AuthStorage` facade — `.oauth`/`.sessions`/`.health`/`.credentials`/`.keys`).
 
 ## Installation
 
@@ -109,7 +109,7 @@ Prefer `/accounts rotation` and `/model-fallback set` over hand-editing the file
 
 Best-effort readable labels: `email` → meaningful `orgName` → `accountId` → credential id.
 
-Providers like **kimi-code** often omit `email` in `AuthStorage.listOAuthAccounts` / JWT claims — the extension shows whatever the omp API surfaces (`accountId`, etc.). See `packages/ai/src/auth-storage.ts` (`OAuthAccountSummary`).
+Providers like **kimi-code** often omit `email` in `AuthStorage.oauth.accounts` / JWT claims — the extension shows whatever the omp API surfaces (`accountId`, etc.). See `packages/ai/src/auth-storage.ts` (`OAuthAccountSummary`).
 
 ## License
 

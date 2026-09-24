@@ -1,5 +1,5 @@
-import { describe, expect, test } from "bun:test";
-import {
+import { describe, expect, mock, test } from "bun:test";
+import accountsExtension, {
 	accountLabel,
 	decideRotation,
 	normalizeRotationPolicy,
@@ -257,5 +257,148 @@ describe("inline hints", () => {
 	test("accounts ceiling delegates to model-fallback hints", () => {
 		expect(accountsInlineHint("ceiling se")).toBe("t <model> <percent> [fallback]");
 		expect(accountsInlineHint("li")).toBe("st [provider|all]");
+	});
+});
+
+// -----------------------------------------------------------------------------
+// Regression test for the "authOf(ctx).getOAuthAccountIdentity is not a
+// function" class of bug: AuthStorageLike drifting from the real namespaced
+// AuthStorage facade (.oauth/.sessions/.health/.credentials/.keys). Exercises
+// every AuthStorageLike method through the actual registered hooks and the
+// /accounts command handler against a mock shaped exactly like the real
+// facade, so a future rename/move of any method fails loudly here instead of
+// at runtime in a user's session.
+// -----------------------------------------------------------------------------
+describe("accountsExtension against the namespaced AuthStorage facade", () => {
+	/** Minimal structural shape this test needs from ExtensionContext/ExtensionCommandContext. */
+	interface TestCtx {
+		sessionManager: { getSessionId(): string };
+		modelRegistry: { authStorage: unknown };
+		model: { provider: string; id: string; baseUrl: string | undefined };
+		models: { list(): Array<{ provider: string; id: string }> };
+		hasUI: boolean;
+		isIdle(): boolean;
+	}
+
+	/** Minimal structural shape this test needs from ExtensionAPI. */
+	interface TestPi {
+		setLabel(label: string): void;
+		on(name: string, fn: (event: unknown, ctx: TestCtx) => unknown): void;
+		registerCommand(name: string, def: { handler: (args: string, ctx: TestCtx) => unknown }): void;
+	}
+
+	// A model id that cannot collide with a real developer's accounts.config.json
+	// ceiling rules: loadConfig() reads that file eagerly at module import time
+	// (no test seam), so `turn_start` -> applyCeiling must be a guaranteed no-op
+	// regardless of the machine's real config content.
+	const TEST_MODEL_ID = "test-model-no-ceiling-rule-can-match-this-9c1f3a";
+
+	function buildHarness() {
+		const hooks: Record<string, (event: unknown, ctx: TestCtx) => unknown> = {};
+		const commands: Record<string, { handler: (args: string, ctx: TestCtx) => unknown }> = {};
+		const pi: TestPi = {
+			setLabel: () => {},
+			on: (name, fn) => {
+				hooks[name] = fn;
+			},
+			registerCommand: (name, def) => {
+				commands[name] = def;
+			},
+		};
+		// TestPi models only the ExtensionAPI surface this extension calls; the real
+		// type comes from an external package this repo doesn't depend on for types.
+		accountsExtension(pi as unknown as Parameters<typeof accountsExtension>[0]);
+
+		// Only "anthropic" has stored accounts; any other provider is empty, which
+		// exercises the keys.describe fallback branch below.
+		const accounts: OAuthAccountSummary[] = [
+			{ position: 0, credentialId: 1, email: "a@example.com", accountId: "acc1", active: true },
+			{ position: 1, credentialId: 2, email: "b@example.com", accountId: "acc2", active: false },
+		];
+		const authStorage = {
+			oauth: {
+				accounts: mock((provider: string) => (provider === "anthropic" ? accounts : [])),
+				identity: mock(() => ({ email: "a@example.com", accountId: "acc1" })),
+			},
+			sessions: {
+				pin: mock(() => true),
+				release: mock(() => true),
+			},
+			health: {
+				model: mock(async () => ({
+					state: "healthy" as const,
+					accounts: [
+						{ credentialId: 1, credentialType: "oauth", state: "healthy" as const, remainingFraction: 0.8 },
+						{ credentialId: 2, credentialType: "oauth", state: "healthy" as const, remainingFraction: 0.5 },
+					],
+				})),
+			},
+			credentials: {
+				removeById: mock(async () => true),
+				all: mock(() => ({ anthropic: [{}] })),
+			},
+			keys: {
+				describe: mock(() => "stored key"),
+			},
+		};
+		function ctx(): TestCtx {
+			return {
+				sessionManager: { getSessionId: () => "sess1" },
+				modelRegistry: { authStorage },
+				model: { provider: "anthropic", id: TEST_MODEL_ID, baseUrl: undefined },
+				models: { list: () => [{ provider: "anthropic", id: TEST_MODEL_ID }] },
+				hasUI: false,
+				isIdle: () => true,
+			};
+		}
+		return { hooks, commands, authStorage, ctx };
+	}
+
+	test("session_start and turn_start hooks are registered and resolve through oauth/health", async () => {
+		const { hooks, authStorage, ctx } = buildHarness();
+		expect(hooks.session_start).toBeDefined();
+		expect(hooks.turn_start).toBeDefined();
+		await hooks.session_start!({}, ctx());
+		await hooks.turn_start!({}, ctx());
+		// turn_start always calls oauth.accounts (via refreshCompletionCache) and
+		// applyCeiling, which no-ops before ever calling health.model because
+		// TEST_MODEL_ID matches no configured ceiling rule.
+		expect(authStorage.oauth.accounts).toHaveBeenCalled();
+	});
+
+	test("/accounts list calls oauth.accounts; /accounts list <empty provider> falls through to keys.describe", async () => {
+		const { commands, authStorage, ctx } = buildHarness();
+		expect(commands.accounts).toBeDefined();
+		await commands.accounts.handler("list", ctx());
+		expect(authStorage.oauth.accounts).toHaveBeenCalledWith("anthropic", "sess1");
+
+		await commands.accounts.handler("list some-other-provider", ctx());
+		expect(authStorage.oauth.accounts).toHaveBeenCalledWith("some-other-provider", "sess1");
+		expect(authStorage.keys.describe).toHaveBeenCalledWith("some-other-provider", "sess1");
+	});
+
+	test("/accounts set pins through sessions.pin", async () => {
+		const { commands, authStorage, ctx } = buildHarness();
+		await commands.accounts.handler("set 1", ctx());
+		expect(authStorage.sessions.pin).toHaveBeenCalledWith("anthropic", "sess1", 1);
+	});
+
+	test("/accounts unset releases through sessions.release without touching stored config", async () => {
+		const { commands, authStorage, ctx } = buildHarness();
+		await commands.accounts.handler("unset", ctx());
+		expect(authStorage.sessions.release).toHaveBeenCalledWith("anthropic", "sess1");
+	});
+
+	test("/accounts rotation status reads identity through oauth.identity without touching stored config", async () => {
+		const { commands, authStorage, ctx } = buildHarness();
+		await commands.accounts.handler("rotation status", ctx());
+		expect(authStorage.oauth.identity).toHaveBeenCalled();
+	});
+
+	test("/accounts logout releases and removes through sessions.release + credentials.removeById", async () => {
+		const { commands, authStorage, ctx } = buildHarness();
+		await commands.accounts.handler("logout 1", ctx());
+		expect(authStorage.sessions.release).toHaveBeenCalledWith("anthropic", "sess1");
+		expect(authStorage.credentials.removeById).toHaveBeenCalledWith("anthropic", 1);
 	});
 });
