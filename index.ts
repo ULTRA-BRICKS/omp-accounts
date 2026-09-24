@@ -1,7 +1,7 @@
 /**
  * accounts — multi-OAuth-account management for omp.
  *
- * Installed as an omp plugin (`omp plugin install github:alex-mextner/omp-accounts`)
+ * Installed as an omp plugin (`omp plugin install git+https://git.hyperide.ai/ultrabricks/omp-accounts.git`)
  * or dropped into ~/.omp/agent/extensions/accounts/ for native auto-discovery.
  *
  * Provides the /accounts slash command (list/set/unset/rotation/login/logout/ceiling),

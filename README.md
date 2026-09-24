@@ -20,7 +20,7 @@ Requires **omp >= 18.3.0** (needs the namespaced `AuthStorage` facade — `.oaut
 ## Installation
 
 ```sh
-omp plugin install github:alex-mextner/omp-accounts
+omp plugin install git+https://git.hyperide.ai/ultrabricks/omp-accounts.git
 omp plugin upgrade omp-accounts   # after releases
 ```
 

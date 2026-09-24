@@ -11,7 +11,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/alex-mextner/omp-accounts.git"
+    "url": "https://git.hyperide.ai/ultrabricks/omp-accounts.git"
   },
   "keywords": [
     "omp",
@@ -24,9 +24,9 @@
   "author": "alex-mextner",
   "license": "MIT",
   "bugs": {
-    "url": "https://github.com/alex-mextner/omp-accounts/issues"
+    "url": "https://git.hyperide.ai/ultrabricks/omp-accounts/issues"
   },
-  "homepage": "https://github.com/alex-mextner/omp-accounts#readme",
+  "homepage": "https://git.hyperide.ai/ultrabricks/omp-accounts",
   "scripts": {
     "test": "bun test"
   }
