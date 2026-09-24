@@ -5,6 +5,7 @@ import {
 	normalizeRotationPolicy,
 	parseModelFallbackCommand,
 	mergeModelFallbackRule,
+	formatCommandUsageError,
 	type ModelFallbackSetParse,
 	parseRotationMode,
 	buildSubcommandInlineHint,
@@ -179,6 +180,13 @@ function parseSet(...tokens: string[]): ModelFallbackSetParse {
 	return parsed;
 }
 
+/** Parses a command and returns its error message, failing loudly if parsing didn't produce an error. */
+function parseError(...tokens: string[]): string {
+	const parsed = parseModelFallbackCommand(tokens);
+	if (parsed.kind !== "error") throw new Error("test setup failed");
+	return parsed.message;
+}
+
 describe("mergeModelFallbackRule", () => {
 	test("a bare set with no fallback token keeps a previously configured fallback", () => {
 		const existing = { maxUsedFraction: 0.9, fallback: "anthropic/claude-sonnet-4-6" };
@@ -204,7 +212,39 @@ describe("mergeModelFallbackRule", () => {
 	});
 });
 
+describe("formatCommandUsageError", () => {
+	test("prefixes both the Usage and Example lines with the invoking command path", () => {
+		expect(formatCommandUsageError(parseError("set", "opus"), "/model-fallback")).toBe(
+			"Usage: /model-fallback set <model> <percent> [fallback]\nExample: /model-fallback set claude-opus-4-6 90 anthropic/claude-sonnet-4-6",
+		);
+	});
 
+	test("uses the /accounts ceiling command path when called from that alias", () => {
+		expect(formatCommandUsageError(parseError("set", "opus"), "/accounts ceiling")).toBe(
+			"Usage: /accounts ceiling set <model> <percent> [fallback]\nExample: /accounts ceiling set claude-opus-4-6 90 anthropic/claude-sonnet-4-6",
+		);
+	});
+
+	test("a single-line message (no Example line) is still prefixed", () => {
+		expect(formatCommandUsageError(parseError("unset"), "/model-fallback")).toBe(
+			"Usage: /model-fallback unset <model>",
+		);
+	});
+
+	test("a $-containing commandPath is inserted literally, not reinterpreted as a replacement pattern", () => {
+		expect(formatCommandUsageError("Usage: unset <model>", "$&")).toBe("Usage: $& unset <model>");
+	});
+
+	test("passes through the percent-validation error unchanged (no Usage/Example line to prefix)", () => {
+		const message = parseError("set", "m", "0");
+		expect(formatCommandUsageError(message, "/model-fallback")).toBe(message);
+	});
+
+	test("passes through the unknown-action error unchanged ('Use set, ...' does not start with 'Usage: ')", () => {
+		const message = parseError("nope");
+		expect(formatCommandUsageError(message, "/model-fallback")).toBe(message);
+	});
+});
 
 describe("inline hints", () => {
 	const modelHint = buildSubcommandInlineHint([

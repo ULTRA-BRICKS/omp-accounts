@@ -372,6 +372,20 @@ export function mergeModelFallbackRule(
 	return { maxUsedFraction: parsed.percent / 100, fallback: parsed.fallback ?? existing?.fallback };
 }
 
+/**
+ * `parseModelFallbackCommand`'s parse-error messages emit bare "Usage: " /
+ * "Example: " lines with no leading slash-command name (the parser is
+ * shared between `/model-fallback` and `/accounts ceiling`, so it can't
+ * know which one is calling). This prepends the real invoking command path
+ * to each such line.
+ */
+export function formatCommandUsageError(message: string, commandPath: string): string {
+	// A function replacer (not a `$1`-style replacement string) so an
+	// unexpected `$`-containing `commandPath` can never be reinterpreted as
+	// a backreference/match-group token by `String.replace`.
+	return message.replace(/^(Usage|Example): /gm, (_match, label: string) => `${label}: ${commandPath} `);
+}
+
 function resolveAccount(
 	accounts: OAuthAccountSummary[],
 	selector: string,
@@ -700,7 +714,6 @@ export default function accountsExtension(pi: ExtensionAPI) {
 		return completeModelFallbackArgs(argumentPrefix, completionCache);
 	}
 
-
 	function completeAccountsArgument(argumentPrefix: string): CompletionItem[] | null {
 		const spaceIndex = argumentPrefix.indexOf(" ");
 		if (spaceIndex === -1) {
@@ -989,15 +1002,10 @@ export default function accountsExtension(pi: ExtensionAPI) {
 				return;
 			}
 			case "error":
-				say(
-					ctx,
-					`${parsed.message.replace(/^Usage: /, `Usage: ${commandPath} `)}`,
-					"warning",
-				);
+				say(ctx, formatCommandUsageError(parsed.message, commandPath), "warning");
 				return;
 		}
 	}
-
 
 	// -- events ---------------------------------------------------------------
 
